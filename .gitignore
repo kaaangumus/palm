@@ -1,0 +1,9 @@
+palm
+palm.exe
+*.test
+*.out
+coverage.txt
+dist/
+build/
+tmp/
+*.log
