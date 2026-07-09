@@ -1,0 +1,30 @@
+name: Bug report
+description: Report a reproducible problem in palm.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the problem and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Commands, input sample, and output.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: palm -version
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: Linux, macOS, Windows, WSL

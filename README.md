@@ -1,4 +1,4 @@
-<h1 align="center">palm</h1>
+﻿<h1 align="center">palm</h1>
 
 <p align="center">
   <strong>Fast subdomain live checking with neon 80s Miami energy.</strong>
@@ -10,6 +10,8 @@
 
 <p align="center">
   <img alt="Go" src="https://img.shields.io/badge/Go-1.22+-00ADD8?style=for-the-badge&logo=go&logoColor=white">
+  <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/kaaangumus/palm/ci.yml?branch=main&style=for-the-badge&label=CI">
+  <img alt="License" src="https://img.shields.io/github/license/kaaangumus/palm?style=for-the-badge">
   <img alt="Recon" src="https://img.shields.io/badge/recon-pipeline-ff4fd8?style=for-the-badge">
   <img alt="Mode" src="https://img.shields.io/badge/mode-http%20%7C%20dns%20%7C%20both-00ffc6?style=for-the-badge">
 </p>
@@ -58,6 +60,8 @@ Build a Linux binary from another system:
 ```bash
 GOOS=linux GOARCH=amd64 go build -o palm .
 ```
+
+Release binaries are generated automatically when a `v*` tag is pushed.
 
 ## Quick Start
 
@@ -139,6 +143,10 @@ palm subs.txt -takeover -json
 
 `-takeover` checks CNAME targets and known provider error fingerprints. Treat matches as takeover risk findings that should be manually verified before reporting.
 
+## Responsible Use
+
+Only scan domains and infrastructure you own or have permission to test. `palm` is built for authorized recon workflows.
+
 ## Flags
 
 ```text
@@ -208,3 +216,15 @@ palm -miami
 ```
 
 `Kaan Gümüş`
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Security
+
+See [SECURITY.md](SECURITY.md).
+
+## License
+
+[MIT](LICENSE)
