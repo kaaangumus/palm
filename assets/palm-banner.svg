@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-labelledby="title desc">
+  <title id="title">palm neon cyber beach banner</title>
+  <desc id="desc">A neon 1980s Miami inspired sunset with palm silhouettes, synthwave grid, and the palm CLI name.</desc>
+  <defs>
+    <linearGradient id="sky" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0" stop-color="#16002d"/>
+      <stop offset="0.38" stop-color="#3b0a5f"/>
+      <stop offset="0.74" stop-color="#ff2c91"/>
+      <stop offset="1" stop-color="#ffb000"/>
+    </linearGradient>
+    <linearGradient id="sun" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0" stop-color="#fff27a"/>
+      <stop offset="0.42" stop-color="#ff7ab6"/>
+      <stop offset="1" stop-color="#7417ff"/>
+    </linearGradient>
+    <linearGradient id="chrome" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.38" stop-color="#8dfcff"/>
+      <stop offset="0.48" stop-color="#ffffff"/>
+      <stop offset="0.58" stop-color="#ff5bd7"/>
+      <stop offset="1" stop-color="#7b2cff"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="softGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <clipPath id="sunClip">
+      <circle cx="600" cy="184" r="104"/>
+    </clipPath>
+  </defs>
+
+  <rect width="1200" height="420" rx="30" fill="#120022"/>
+  <rect x="10" y="10" width="1180" height="400" rx="24" fill="url(#sky)"/>
+
+  <g opacity="0.45">
+    <circle cx="112" cy="78" r="1.8" fill="#fff"/>
+    <circle cx="214" cy="46" r="1.4" fill="#fff"/>
+    <circle cx="972" cy="66" r="1.6" fill="#fff"/>
+    <circle cx="1084" cy="112" r="1.3" fill="#fff"/>
+    <circle cx="842" cy="38" r="1.2" fill="#fff"/>
+    <circle cx="412" cy="64" r="1.4" fill="#fff"/>
+  </g>
+
+  <g filter="url(#softGlow)">
+    <circle cx="600" cy="184" r="104" fill="url(#sun)"/>
+  </g>
+  <g clip-path="url(#sunClip)" opacity="0.82">
+    <rect x="486" y="126" width="228" height="10" fill="#16002d"/>
+    <rect x="486" y="154" width="228" height="12" fill="#16002d"/>
+    <rect x="486" y="188" width="228" height="14" fill="#16002d"/>
+    <rect x="486" y="228" width="228" height="18" fill="#16002d"/>
+    <rect x="486" y="276" width="228" height="20" fill="#16002d"/>
+  </g>
+
+  <path d="M20 300 C170 270 278 286 406 306 C514 323 656 326 770 308 C894 288 1026 272 1180 294 L1180 410 L20 410 Z" fill="#0d0625" opacity="0.9"/>
+  <path d="M20 334 C202 302 370 310 520 330 C678 352 838 336 1008 310 C1076 300 1136 304 1180 316 L1180 410 L20 410 Z" fill="#050014"/>
+
+  <g stroke="#00f6ff" stroke-width="1.4" opacity="0.58">
+    <path d="M0 352 H1200"/>
+    <path d="M54 374 H1146"/>
+    <path d="M118 394 H1082"/>
+    <path d="M600 330 L322 420"/>
+    <path d="M600 330 L470 420"/>
+    <path d="M600 330 L600 420"/>
+    <path d="M600 330 L730 420"/>
+    <path d="M600 330 L878 420"/>
+    <path d="M260 330 L112 420"/>
+    <path d="M940 330 L1088 420"/>
+  </g>
+
+  <g fill="#050014">
+    <path d="M168 322 C174 278 180 224 172 164 C168 134 162 110 150 82 C170 112 184 144 188 176 C196 236 188 284 182 324 Z"/>
+    <path d="M166 104 C116 66 72 64 42 80 C92 92 126 108 168 128 Z"/>
+    <path d="M170 106 C142 54 120 38 82 30 C112 64 136 92 174 132 Z"/>
+    <path d="M174 106 C194 50 226 26 276 20 C238 60 210 92 180 132 Z"/>
+    <path d="M178 112 C232 72 280 70 322 92 C268 98 226 112 178 136 Z"/>
+    <path d="M176 116 C226 126 252 154 274 190 C224 174 198 154 176 134 Z"/>
+  </g>
+
+  <g fill="#050014">
+    <path d="M1016 330 C1010 286 1004 232 1012 172 C1016 142 1022 118 1034 90 C1014 120 1000 152 996 184 C988 244 996 292 1002 332 Z"/>
+    <path d="M1018 112 C1068 74 1112 72 1142 88 C1092 100 1058 116 1016 136 Z"/>
+    <path d="M1014 114 C1042 62 1064 46 1102 38 C1072 72 1048 100 1010 140 Z"/>
+    <path d="M1010 114 C990 58 958 34 908 28 C946 68 974 100 1004 140 Z"/>
+    <path d="M1006 120 C952 80 904 78 862 100 C916 106 958 120 1006 144 Z"/>
+    <path d="M1008 124 C958 134 932 162 910 198 C960 182 986 162 1008 142 Z"/>
+  </g>
+
+  <g filter="url(#glow)">
+    <text x="600" y="214" text-anchor="middle" font-family="Impact, Haettenschweiler, 'Arial Black', sans-serif" font-size="104" letter-spacing="8" fill="url(#chrome)" stroke="#1a0038" stroke-width="5">PALM</text>
+    <text x="600" y="262" text-anchor="middle" font-family="'Trebuchet MS', Arial, sans-serif" font-size="24" letter-spacing="7" fill="#00fff0">SUBDOMAIN LIVE CHECKER</text>
+  </g>
+
+  <rect x="10" y="10" width="1180" height="400" rx="24" fill="none" stroke="#ff62d8" stroke-width="2" opacity="0.75"/>
+  <rect x="18" y="18" width="1164" height="384" rx="19" fill="none" stroke="#00fff0" stroke-width="1" opacity="0.45"/>
+</svg>

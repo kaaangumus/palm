@@ -1,11 +1,11 @@
 <h1 align="center">palm</h1>
 
 <p align="center">
-  <strong>Fast subdomain live checking with midnight beach energy.</strong>
+  <strong>Fast subdomain live checking with neon 80s Miami energy.</strong>
 </p>
 
 <p align="center">
-  <img src="https://commons.wikimedia.org/wiki/Special:Redirect/file/Palm_trees_on_a_beach.jpg" width="820" alt="Neon beach palms">
+  <img src="assets/palm-banner.svg" width="820" alt="palm neon 80s Miami subdomain live checker banner">
 </p>
 
 <p align="center">
@@ -17,8 +17,6 @@
 <p align="center">
   <code>subfinder -d example.com -silent | palm -status -title -server</code>
 </p>
-
-Photo: [Palm trees on a beach](https://commons.wikimedia.org/wiki/File:Palm_trees_on_a_beach.jpg), CC0.
 
 **palm** is a fast and simple subdomain live checker with neon coast vibes: clean pipelines, quick signal, and just enough style to make recon feel less grey.
 
