@@ -20,10 +20,21 @@ It reads subdomains from stdin or a `.txt` file, removes duplicates, normalizes 
 ## Install
 
 ```bash
-git clone <repo-url>
+go install github.com/kaaangumus/palm@latest
+```
+
+Make sure your Go bin directory is in `PATH`:
+
+```bash
+export PATH="$PATH:$(go env GOPATH)/bin"
+```
+
+Build from source:
+
+```bash
+git clone https://github.com/kaaangumus/palm.git
 cd palm
 go build -o palm .
-sudo mv palm /usr/local/bin/
 ```
 
 Build a Linux binary from another system:
