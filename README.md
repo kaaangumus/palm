@@ -1,14 +1,28 @@
-# palm
+<h1 align="center">palm</h1>
 
 <p align="center">
-  <img src="https://commons.wikimedia.org/wiki/Special:Redirect/file/Palm_trees_on_a_beach.jpg" width="820" alt="Palm trees on a beach">
+  <strong>Fast subdomain live checking with midnight beach energy.</strong>
+</p>
+
+<p align="center">
+  <img src="https://commons.wikimedia.org/wiki/Special:Redirect/file/Palm_trees_on_a_beach.jpg" width="820" alt="Neon beach palms">
+</p>
+
+<p align="center">
+  <img alt="Go" src="https://img.shields.io/badge/Go-1.22+-00ADD8?style=for-the-badge&logo=go&logoColor=white">
+  <img alt="Recon" src="https://img.shields.io/badge/recon-pipeline-ff4fd8?style=for-the-badge">
+  <img alt="Mode" src="https://img.shields.io/badge/mode-http%20%7C%20dns%20%7C%20both-00ffc6?style=for-the-badge">
+</p>
+
+<p align="center">
+  <code>subfinder -d example.com -silent | palm -status -title -server</code>
 </p>
 
 Photo: [Palm trees on a beach](https://commons.wikimedia.org/wiki/File:Palm_trees_on_a_beach.jpg), CC0.
 
-**palm** is a fast and simple subdomain live checker with a little Miami breeze.
+**palm** is a fast and simple subdomain live checker with neon coast vibes: clean pipelines, quick signal, and just enough style to make recon feel less grey.
 
-It reads subdomains from stdin or a `.txt` file, removes duplicates, normalizes messy tool output, and checks whether targets are live with DNS and/or HTTP probes.
+It reads subdomains from stdin or a `.txt` file, removes duplicates, normalizes messy tool output, and checks whether targets are live with DNS, HTTP, metadata, and takeover fingerprints.
 
 ## Why palm?
 
@@ -16,8 +30,10 @@ It reads subdomains from stdin or a `.txt` file, removes duplicates, normalizes 
 - File-friendly: `palm subs.txt`
 - Fast enough for daily recon
 - Simple output for chaining into other tools
+- HTTP metadata: status, title, server, content length
+- Takeover fingerprint checks
 - Turkish and English help output
-- Tiny easter egg hidden under the shade
+- Tiny Miami-mode easter egg hidden under the shade
 
 ## Install
 
