@@ -405,17 +405,15 @@ Tip: palm reads stdin and accepts txt files too: palm subs.txt
 }
 
 func miamiEgg() string {
-	return `        _
-      _| |_
-    _|     |_
-     \ .-. /
-      /___\
-       | |
-       | |
-      /___\
+	return `
+  ____   _    _     __  __
+ |  _ \ / \  | |   |  \/  |
+ | |_) / _ \ | |   | |\/| |
+ |  __/ ___ \| |___| |  | |
+ |_| /_/   \_\_____|_|  |_|
 
- palm vibes from Miami
- easter egg: Kaan Gümüş
+        Miami mode: on
+        Easter egg: Kaan Gümüş
 `
 }
 

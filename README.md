@@ -1,15 +1,8 @@
 # palm
 
-```
-        _
-      _| |_
-    _|     |_
-     \ .-. /
-      /___\
-       | |
-       | |
-      /___\
-```
+![South Beach palms](https://commons.wikimedia.org/wiki/Special:Redirect/file/South_Beach_palms_%28Unsplash%29.jpg)
+
+Photo: [South Beach palms](https://commons.wikimedia.org/wiki/File:South_Beach_palms_%28Unsplash%29.jpg), CC0.
 
 **palm** is a fast and simple subdomain live checker with a little Miami breeze.
 
