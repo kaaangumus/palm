@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.0
+
+- Added self-update support with `-update`.
+- Added release checks with `-check-update`.
+
 ## 0.2.0
 
 - Added response time output with `-rt`.

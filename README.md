@@ -63,6 +63,18 @@ GOOS=linux GOARCH=amd64 go build -o palm .
 
 Release binaries are generated automatically when a `v*` tag is pushed.
 
+Update later:
+
+```bash
+palm -update
+```
+
+Check whether a newer release exists:
+
+```bash
+palm -check-update
+```
+
 ## Quick Start
 
 ```bash
@@ -184,6 +196,8 @@ Only scan domains and infrastructure you own or have permission to test. `palm` 
 -takeover          check subdomain takeover fingerprints
 -q                 only print live hosts/URLs
 -tools             show common tool pipelines
+-check-update      check latest GitHub release
+-update            update palm with go install
 -version           show version
 -h                 show help
 ```

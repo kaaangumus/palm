@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -84,6 +86,28 @@ func TestUsageDefaultsToEnglish(t *testing.T) {
 	got := usage()
 	if !strings.Contains(got, "Usage:") {
 		t.Fatalf("usage() did not return English help: %q", got)
+	}
+}
+
+func TestReleaseInfoJSON(t *testing.T) {
+	var info releaseInfo
+	if err := json.Unmarshal([]byte(`{"tag_name":"v0.2.0","html_url":"https://example.com/release"}`), &info); err != nil {
+		t.Fatal(err)
+	}
+	if info.TagName != "v0.2.0" {
+		t.Fatalf("TagName = %q, want v0.2.0", info.TagName)
+	}
+	if info.URL != "https://example.com/release" {
+		t.Fatalf("URL = %q, want release URL", info.URL)
+	}
+}
+
+func TestCheckForUpdateOutputUsesCurrentVersion(t *testing.T) {
+	var out bytes.Buffer
+	fmtCheckVersion(&out, releaseInfo{TagName: "v" + version, URL: "https://example.com/release"})
+	got := out.String()
+	if !strings.Contains(got, "palm is up to date") {
+		t.Fatalf("check output = %q, want up-to-date message", got)
 	}
 }
 

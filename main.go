@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,7 +22,9 @@ import (
 	"time"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
+const modulePath = "github.com/kaaangumus/palm"
+const latestReleaseURL = "https://api.github.com/repos/kaaangumus/palm/releases/latest"
 
 type config struct {
 	inputFile       string
@@ -72,6 +75,11 @@ type httpProbe struct {
 	Length         *int64
 	ResponseTimeMS *int64
 	Location       string
+}
+
+type releaseInfo struct {
+	TagName string `json:"tag_name"`
+	URL     string `json:"html_url"`
 }
 
 type headerFlags []string
@@ -166,6 +174,8 @@ func parseFlags(args []string) (config, error) {
 	fs.BoolVar(&cfg.quiet, "q", false, "only print live hosts/URLs")
 	showHelp := fs.Bool("h", false, "show help")
 	showVersion := fs.Bool("version", false, "show version")
+	checkUpdate := fs.Bool("check-update", false, "check latest GitHub release")
+	runUpdate := fs.Bool("update", false, "update palm with go install")
 	showTools := fs.Bool("tools", false, "show common tool pipelines")
 	showMiami := fs.Bool("miami", false, "show the Miami easter egg")
 
@@ -178,6 +188,18 @@ func parseFlags(args []string) (config, error) {
 	}
 	if *showVersion {
 		fmt.Fprintln(os.Stdout, "palm "+version)
+		os.Exit(0)
+	}
+	if *checkUpdate {
+		if err := checkForUpdate(os.Stdout); err != nil {
+			return cfg, err
+		}
+		os.Exit(0)
+	}
+	if *runUpdate {
+		if err := updatePalm(os.Stdout, os.Stderr); err != nil {
+			return cfg, err
+		}
 		os.Exit(0)
 	}
 	if *showTools {
@@ -315,6 +337,71 @@ func stdinIsTerminal() bool {
 	return info.Mode()&os.ModeCharDevice != 0
 }
 
+func checkForUpdate(w io.Writer) error {
+	latest, err := latestRelease()
+	if err != nil {
+		return err
+	}
+	fmtCheckVersion(w, latest)
+	return nil
+}
+
+func fmtCheckVersion(w io.Writer, latest releaseInfo) {
+	latestVersion := strings.TrimPrefix(latest.TagName, "v")
+	fmt.Fprintf(w, "current: %s\n", version)
+	fmt.Fprintf(w, "latest:  %s\n", latestVersion)
+	if latestVersion == version {
+		fmt.Fprintln(w, "palm is up to date")
+		return
+	}
+	fmt.Fprintf(w, "update:  palm -update\n")
+	if latest.URL != "" {
+		fmt.Fprintf(w, "release: %s\n", latest.URL)
+	}
+}
+
+func latestRelease() (releaseInfo, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, latestReleaseURL, nil)
+	if err != nil {
+		return releaseInfo{}, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "palm/"+version)
+	resp, err := client.Do(req)
+	if err != nil {
+		return releaseInfo{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return releaseInfo{}, fmt.Errorf("GitHub release check failed: %s", resp.Status)
+	}
+	var latest releaseInfo
+	if err := json.NewDecoder(resp.Body).Decode(&latest); err != nil {
+		return releaseInfo{}, err
+	}
+	if latest.TagName == "" {
+		return releaseInfo{}, errors.New("GitHub release check returned an empty tag")
+	}
+	return latest, nil
+}
+
+func updatePalm(stdout, stderr io.Writer) error {
+	if _, err := exec.LookPath("go"); err != nil {
+		return errors.New("go command not found; install Go or download a binary from the GitHub releases page")
+	}
+	fmt.Fprintf(stdout, "updating palm with: go install %s@latest\n", modulePath)
+	cmd := exec.Command("go", "install", modulePath+"@latest")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, "update complete")
+	fmt.Fprintln(stdout, "restart your shell or run `hash -r` if your shell cached the old binary")
+	return nil
+}
+
 func usageError() error {
 	return errors.New(strings.TrimSpace(usage()))
 }
@@ -358,6 +445,8 @@ Flags:
   -takeover          check subdomain takeover fingerprints
   -q                 only print live hosts/URLs
   -tools             show common tool pipelines
+  -check-update      check latest GitHub release
+  -update            update palm with go install
   -version           show version
   -h                 show help
 `
@@ -396,6 +485,8 @@ Parametreler:
   -takeover          subdomain takeover fingerprint kontrolu yap
   -q                 sadece live host/URL yaz
   -tools             yaygin araclarla ornek pipeline goster
+  -check-update      en son GitHub release surumunu kontrol et
+  -update            go install ile palm'i guncelle
   -version           surumu goster
   -h                 yardimi goster
 `
