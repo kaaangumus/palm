@@ -58,11 +58,37 @@ It intentionally does not try to be a screenshot tool, technology detector, WAF/
 
 ## Install
 
+Recommended Linux/macOS install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kaaangumus/palm/main/install.sh | sh
+```
+
+If you do not have `curl`:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/kaaangumus/palm/main/install.sh | sh
+```
+
+The installer downloads the latest release binary and places it in `/usr/local/bin`, so you can run:
+
+```bash
+palm -version
+```
+
+Install without sudo:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kaaangumus/palm/main/install.sh | PALM_INSTALL_DIR="$HOME/.local/bin" sh
+```
+
+Install with Go:
+
 ```bash
 go install github.com/kaaangumus/palm@latest
 ```
 
-Make sure your Go bin directory is in `PATH`:
+If you install with Go, make sure your Go bin directory is in `PATH`:
 
 ```bash
 export PATH="$PATH:$(go env GOPATH)/bin"
