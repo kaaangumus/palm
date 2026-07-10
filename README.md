@@ -1,7 +1,7 @@
-﻿<h1 align="center">palm</h1>
+<h1 align="center">palm</h1>
 
 <p align="center">
-  <strong>Fast subdomain live checking with neon 80s Miami energy.</strong>
+  <strong>Bug bounty subdomain recon pre-filter for live and takeover checks.</strong>
 </p>
 
 <p align="center">
@@ -20,20 +20,41 @@
   <code>subfinder -d example.com -silent | palm -status -title -server</code>
 </p>
 
-**palm** is a fast and simple subdomain live checker with neon coast vibes: clean pipelines, quick signal, and just enough style to make recon feel less grey.
+**palm** is a bug bounty focused subdomain recon pre-filter. It sits after tools like `subfinder`, `amass`, `assetfinder`, `findomain`, or `chaos` and turns noisy discovery output into clean, live, actionable targets.
 
-It reads subdomains from stdin or a `.txt` file, removes duplicates, normalizes messy tool output, and checks whether targets are live with DNS, HTTP, metadata, and takeover fingerprints.
+It reads subdomains from stdin or a `.txt` file, removes duplicates, normalizes messy tool output, checks DNS/HTTP liveness, adds lightweight context, and highlights possible subdomain takeover risks.
 
 ## Why palm?
 
 - Pipe-friendly: `subfinder -d example.com -silent | palm`
 - File-friendly: `palm subs.txt`
-- Fast enough for daily recon
-- Simple output for chaining into other tools
-- HTTP metadata: status, title, server, content length
-- Takeover fingerprint checks
+- Built for post-discovery bug bounty triage
+- Clean live target output for notes, reports, or the next tool
+- Lightweight context: status, title, server, content length, response time
+- Takeover fingerprint checks for quick risk prioritization
 - Turkish and English help output
 - Tiny Miami-mode easter egg hidden under the shade
+
+## What palm is
+
+`palm` is a focused triage step between subdomain discovery and deeper testing:
+
+```text
+subdomain discovery -> palm -> manual review / deeper tooling
+```
+
+Use it when you want to quickly answer:
+
+- Which discovered subdomains resolve?
+- Which ones are HTTP/HTTPS live?
+- Which live targets look worth opening first?
+- Are there obvious takeover-risk fingerprints?
+
+## What palm is not
+
+`palm` is not an `httpx` clone or a full web fingerprinting engine.
+
+It intentionally does not try to be a screenshot tool, technology detector, WAF/CDN analyzer, favicon hasher, TLS deep inspector, path brute forcer, or headless browser. Those jobs belong to specialized tools. `palm` stays small so the bug bounty workflow stays fast.
 
 ## Install
 
@@ -78,16 +99,41 @@ palm -check-update
 ## Quick Start
 
 ```bash
-palm subs.txt
-palm subs.txt -status
-palm subs.txt -mc 200,301,302 -title -server
-palm subs.txt -rt -location -follow-redirects=false
-palm subs.txt -takeover
-palm subs.txt -mode dns -status
-palm subs.txt -mode both -json -o live.jsonl
+subfinder -d example.com -silent | palm -status -title -server -rt
+subfinder -d example.com -silent | palm -takeover -status
+subfinder -d example.com -silent | palm -mode dns -status -o resolved.txt
+subfinder -d example.com -silent | palm -json -status -title -server -o live.jsonl
 ```
 
 Default mode is `http`, so palm prints live `https://` or `http://` URLs.
+
+## Bug Bounty Workflow
+
+Collect subdomains:
+
+```bash
+subfinder -d example.com -silent | tee subs.txt
+```
+
+Resolve and clean:
+
+```bash
+palm subs.txt -mode dns -status -o resolved.txt
+```
+
+Find live web targets:
+
+```bash
+palm subs.txt -status -title -server -rt -o live.txt
+```
+
+Check takeover-risk fingerprints:
+
+```bash
+palm subs.txt -takeover -json -o takeover-check.jsonl
+```
+
+Then manually review the interesting targets. Takeover matches are risk hints, not final proof.
 
 ## Works Great With
 
