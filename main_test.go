@@ -67,7 +67,7 @@ func TestUsageUsesTurkishLocale(t *testing.T) {
 	t.Setenv("LANG", "")
 
 	got := usage()
-	if !strings.Contains(got, "Kullanım:") {
+	if !strings.Contains(got, "Kullanim:") {
 		t.Fatalf("usage() did not return Turkish help: %q", got)
 	}
 	if !strings.Contains(got, "-mode string") {
@@ -167,27 +167,83 @@ func TestCheckHTTPMetadata(t *testing.T) {
 
 func TestFormatHTTPResultMetadata(t *testing.T) {
 	length := int64(123)
+	rt := int64(42)
 	got := formatHTTPResult(result{
-		URL:        "https://example.com",
-		StatusCode: 200,
-		Title:      "Example",
-		Server:     "nginx",
-		Length:     &length,
-	}, config{status: true, title: true, server: true, contentLen: true})
+		URL:            "https://example.com",
+		StatusCode:     200,
+		Title:          "Example",
+		Server:         "nginx",
+		Length:         &length,
+		ResponseTimeMS: &rt,
+		Location:       "https://example.com/login",
+	}, config{status: true, title: true, server: true, contentLen: true, responseTime: true, location: true})
 
-	want := "https://example.com [200 | title=Example | server=nginx | cl=123]"
+	want := "https://example.com [200 | title=Example | server=nginx | cl=123 | rt=42ms | location=https://example.com/login]"
 	if got != want {
 		t.Fatalf("formatHTTPResult = %q, want %q", got, want)
 	}
 }
 
 func TestParseFlagsTakeover(t *testing.T) {
-	cfg, err := parseFlags([]string{"subs.txt", "-takeover"})
+	cfg, err := parseFlags([]string{"subs.txt", "-takeover", "-rt", "-location", "-follow-redirects=false", "-method", "GET", "-H", "X-Test: yes"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !cfg.takeover {
 		t.Fatal("takeover = false, want true")
+	}
+	if !cfg.responseTime {
+		t.Fatal("responseTime = false, want true")
+	}
+	if !cfg.location {
+		t.Fatal("location = false, want true")
+	}
+	if cfg.followRedirects {
+		t.Fatal("followRedirects = true, want false")
+	}
+	if cfg.method != http.MethodGet {
+		t.Fatalf("method = %q, want GET", cfg.method)
+	}
+	if got := cfg.headers.Get("X-Test"); got != "yes" {
+		t.Fatalf("X-Test header = %q, want yes", got)
+	}
+}
+
+func TestDoRequestCustomHeaderMethodAndTiming(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %q, want GET", r.Method)
+		}
+		if got := r.Header.Get("X-Test"); got != "yes" {
+			t.Fatalf("X-Test header = %q, want yes", got)
+		}
+		w.Header().Set("Location", "/next")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer server.Close()
+
+	client := server.Client()
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	cfg := config{
+		method:       http.MethodGet,
+		headers:      http.Header{"X-Test": []string{"yes"}},
+		responseTime: true,
+		location:     true,
+	}
+	probe, err := doRequest(server.URL, cfg.method, cfg, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe.StatusCode != http.StatusFound {
+		t.Fatalf("status = %d, want 302", probe.StatusCode)
+	}
+	if probe.Location != "/next" {
+		t.Fatalf("location = %q, want /next", probe.Location)
+	}
+	if probe.ResponseTimeMS == nil {
+		t.Fatal("ResponseTimeMS = nil, want value")
 	}
 }
 

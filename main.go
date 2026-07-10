@@ -21,48 +21,68 @@ import (
 	"time"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 type config struct {
-	inputFile    string
-	outputFile   string
-	mode         string
-	concurrency  int
-	timeout      time.Duration
-	resolverFile string
-	jsonOut      bool
-	status       bool
-	title        bool
-	server       bool
-	contentLen   bool
-	takeover     bool
-	quiet        bool
-	matchCodes   map[int]struct{}
-	filterCodes  map[int]struct{}
+	inputFile       string
+	outputFile      string
+	mode            string
+	concurrency     int
+	timeout         time.Duration
+	resolverFile    string
+	jsonOut         bool
+	status          bool
+	title           bool
+	server          bool
+	contentLen      bool
+	responseTime    bool
+	location        bool
+	followRedirects bool
+	method          string
+	headers         http.Header
+	takeover        bool
+	quiet           bool
+	matchCodes      map[int]struct{}
+	filterCodes     map[int]struct{}
 }
 
 type result struct {
-	Host       string   `json:"host"`
-	Live       bool     `json:"live"`
-	DNS        bool     `json:"dns"`
-	IPs        []string `json:"ips,omitempty"`
-	URL        string   `json:"url,omitempty"`
-	StatusCode int      `json:"status_code,omitempty"`
-	Title      string   `json:"title,omitempty"`
-	Server     string   `json:"server,omitempty"`
-	Length     *int64   `json:"content_length,omitempty"`
-	Takeover   bool     `json:"takeover,omitempty"`
-	Provider   string   `json:"takeover_provider,omitempty"`
-	CNAME      string   `json:"cname,omitempty"`
-	Error      string   `json:"error,omitempty"`
+	Host           string   `json:"host"`
+	Live           bool     `json:"live"`
+	DNS            bool     `json:"dns"`
+	IPs            []string `json:"ips,omitempty"`
+	URL            string   `json:"url,omitempty"`
+	StatusCode     int      `json:"status_code,omitempty"`
+	Title          string   `json:"title,omitempty"`
+	Server         string   `json:"server,omitempty"`
+	Length         *int64   `json:"content_length,omitempty"`
+	ResponseTimeMS *int64   `json:"response_time_ms,omitempty"`
+	Location       string   `json:"location,omitempty"`
+	Takeover       bool     `json:"takeover,omitempty"`
+	Provider       string   `json:"takeover_provider,omitempty"`
+	CNAME          string   `json:"cname,omitempty"`
+	Error          string   `json:"error,omitempty"`
 }
 
 type httpProbe struct {
-	URL        string
-	StatusCode int
-	Title      string
-	Server     string
-	Length     *int64
+	URL            string
+	StatusCode     int
+	Title          string
+	Server         string
+	Length         *int64
+	ResponseTimeMS *int64
+	Location       string
+}
+
+type headerFlags []string
+
+func (h *headerFlags) String() string {
+	return strings.Join(*h, ",")
+}
+
+func (h *headerFlags) Set(value string) error {
+	*h = append(*h, value)
+	return nil
 }
 
 type resolverPool struct {
@@ -131,11 +151,17 @@ func parseFlags(args []string) (config, error) {
 	timeout := fs.Int("timeout", 5, "timeout in seconds")
 	matchCodes := fs.String("mc", "", "match HTTP status codes")
 	filterCodes := fs.String("fc", "", "filter HTTP status codes")
+	var headers headerFlags
 	fs.BoolVar(&cfg.jsonOut, "json", false, "write JSON lines")
 	fs.BoolVar(&cfg.status, "status", false, "include HTTP status in text output")
 	fs.BoolVar(&cfg.title, "title", false, "include page title")
 	fs.BoolVar(&cfg.server, "server", false, "include server header")
 	fs.BoolVar(&cfg.contentLen, "cl", false, "include content length")
+	fs.BoolVar(&cfg.responseTime, "rt", false, "include response time")
+	fs.BoolVar(&cfg.location, "location", false, "include redirect location")
+	fs.BoolVar(&cfg.followRedirects, "follow-redirects", true, "follow HTTP redirects")
+	fs.StringVar(&cfg.method, "method", "", "HTTP method")
+	fs.Var(&headers, "H", "custom HTTP header, repeatable")
 	fs.BoolVar(&cfg.takeover, "takeover", false, "check subdomain takeover fingerprints")
 	fs.BoolVar(&cfg.quiet, "q", false, "only print live hosts/URLs")
 	showHelp := fs.Bool("h", false, "show help")
@@ -175,6 +201,14 @@ func parseFlags(args []string) (config, error) {
 		return cfg, errors.New("timeout must be greater than 0")
 	}
 	var err error
+	cfg.headers, err = parseHeaders(headers)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.method = strings.ToUpper(strings.TrimSpace(cfg.method))
+	if cfg.method != "" && !validHTTPMethod(cfg.method) {
+		return cfg, fmt.Errorf("invalid -method: %s", cfg.method)
+	}
 	cfg.matchCodes, err = parseCodes(*matchCodes)
 	if err != nil {
 		return cfg, fmt.Errorf("invalid -mc: %w", err)
@@ -195,7 +229,7 @@ func parseFlags(args []string) (config, error) {
 
 func reorderArgs(args []string) []string {
 	valueFlags := map[string]struct{}{
-		"-l": {}, "-list": {}, "-o": {}, "-mode": {}, "-r": {}, "-c": {}, "-timeout": {}, "-mc": {}, "-fc": {},
+		"-l": {}, "-list": {}, "-o": {}, "-mode": {}, "-r": {}, "-c": {}, "-timeout": {}, "-mc": {}, "-fc": {}, "-method": {}, "-H": {},
 	}
 
 	var flags []string
@@ -222,6 +256,32 @@ func reorderArgs(args []string) []string {
 		}
 	}
 	return append(flags, positional...)
+}
+
+func parseHeaders(values []string) (http.Header, error) {
+	headers := make(http.Header)
+	for _, value := range values {
+		name, headerValue, ok := strings.Cut(value, ":")
+		if !ok {
+			return nil, fmt.Errorf("invalid -H header %q, expected 'Name: value'", value)
+		}
+		name = strings.TrimSpace(name)
+		headerValue = strings.TrimSpace(headerValue)
+		if name == "" || strings.ContainsAny(name, " \t\r\n:") {
+			return nil, fmt.Errorf("invalid -H header name %q", name)
+		}
+		headers.Add(name, headerValue)
+	}
+	return headers, nil
+}
+
+func validHTTPMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodOptions:
+		return true
+	default:
+		return false
+	}
 }
 
 func parseCodes(raw string) (map[int]struct{}, error) {
@@ -261,7 +321,7 @@ func usageError() error {
 
 func usage() string {
 	if isTurkishLocale() {
-		return trUsageClean()
+		return trUsageFresh()
 	}
 	return enUsage()
 }
@@ -290,6 +350,11 @@ Flags:
   -title             include page title
   -server            include server header
   -cl                include content length
+  -rt                include response time
+  -location          include redirect Location header
+  -follow-redirects  follow HTTP redirects (default true)
+  -method string     HTTP method
+  -H string          custom HTTP header, repeatable
   -takeover          check subdomain takeover fingerprints
   -q                 only print live hosts/URLs
   -tools             show common tool pipelines
@@ -298,58 +363,41 @@ Flags:
 `
 }
 
-func trUsage() string {
-	return `palm - hızlı subdomain live checker
+func trUsageFresh() string {
+	return `palm - hizli subdomain live checker
 
-Kullanım:
-  subfinder -d example.com -silent | palm
-  palm subs.txt
-  dnsx -l subs.txt -silent | palm -mode http -status
-  palm -l subs.txt -mode both -json -o live.jsonl
-
-Parametreler:
-  -l, -list string   subdomain liste dosyası
-  -o string          çıktı dosyası
-  -mode string       kontrol modu: dns, http, both (varsayılan "http")
-  -c int             eşzamanlı worker sayısı (varsayılan 100)
-  -timeout int       saniye cinsinden timeout (varsayılan 5)
-  -json              JSON lines formatında yaz
-  -status            text çıktıda HTTP status veya DNS IP bilgisini göster
-  -q                 sadece live host/URL yaz
-  -tools             yaygın araçlarla örnek pipeline göster
-  -version           sürümü göster
-  -h                 yardımı göster
-`
-}
-
-func trUsageClean() string {
-	return `palm - hızlı subdomain live checker
-
-Kullanım:
+Kullanim:
   subfinder -d example.com -silent | palm
   palm subs.txt
   dnsx -l subs.txt -silent | palm -mode http -status
   palm subs.txt -mc 200,301,302 -title -server
+  palm subs.txt -rt -location -follow-redirects=false
   palm -l subs.txt -mode both -json -o live.jsonl
 
 Parametreler:
-  -l, -list string   subdomain liste dosyası
-  -o string          çıktı dosyası
-  -mode string       kontrol modu: dns, http, both (varsayılan "http")
-  -r string          DNS sorguları için resolver dosyası
-  -c int             eşzamanlı worker sayısı (varsayılan 100)
-  -timeout int       saniye cinsinden timeout (varsayılan 5)
-  -mc string         eşleşecek HTTP status kodları, virgülle ayrılır
-  -fc string         filtrelenecek HTTP status kodları, virgülle ayrılır
-  -json              JSON lines formatında yaz
-  -status            text çıktıda HTTP status veya DNS IP bilgisini göster
-  -title             sayfa başlığını göster
-  -server            server header bilgisini göster
-  -cl                content length bilgisini göster
+  -l, -list string   subdomain liste dosyasi
+  -o string          cikti dosyasi
+  -mode string       kontrol modu: dns, http, both (varsayilan "http")
+  -r string          DNS sorgulari icin resolver dosyasi
+  -c int             eszamanli worker sayisi (varsayilan 100)
+  -timeout int       saniye cinsinden timeout (varsayilan 5)
+  -mc string         eslesecek HTTP status kodlari, virgulle ayrilir
+  -fc string         filtrelenecek HTTP status kodlari, virgulle ayrilir
+  -json              JSON lines formatinda yaz
+  -status            text ciktida HTTP status veya DNS IP bilgisini goster
+  -title             sayfa basligini goster
+  -server            server header bilgisini goster
+  -cl                content length bilgisini goster
+  -rt                response time bilgisini goster
+  -location          redirect Location header bilgisini goster
+  -follow-redirects  HTTP redirect takip et (varsayilan true)
+  -method string     HTTP method
+  -H string          custom HTTP header, tekrar edilebilir
+  -takeover          subdomain takeover fingerprint kontrolu yap
   -q                 sadece live host/URL yaz
-  -tools             yaygın araçlarla örnek pipeline göster
-  -version           sürümü göster
-  -h                 yardımı göster
+  -tools             yaygin araclarla ornek pipeline goster
+  -version           surumu goster
+  -h                 yardimi goster
 `
 }
 
@@ -365,7 +413,7 @@ func isTurkishLocale() bool {
 
 func localizedToolsUsage() string {
 	if isTurkishLocale() {
-		return `palm ile yaygın araç örnekleri:
+		return `palm ile yaygin arac ornekleri:
 
   subfinder -d example.com -silent | palm
   assetfinder --subs-only example.com | palm
@@ -373,25 +421,13 @@ func localizedToolsUsage() string {
   findomain -t example.com -q | palm
   chaos -d example.com -silent | palm
 
-Not: palm stdin'den okur, txt dosyası da kabul eder: palm subs.txt
+Not: palm stdin'den okur, txt dosyasi da kabul eder: palm subs.txt
 `
 	}
 	return toolsUsage()
 }
 
 func toolsUsage() string {
-	if isTurkishLocale() {
-		return `palm ile yaygın araç örnekleri:
-
-  subfinder -d example.com -silent | palm
-  assetfinder --subs-only example.com | palm
-  amass enum -passive -d example.com | palm
-  findomain -t example.com -q | palm
-  chaos -d example.com -silent | palm
-
-Not: palm stdin'den okur, txt dosyası da kabul eder: palm subs.txt
-`
-	}
 	return `Common tool pipelines for palm:
 
   subfinder -d example.com -silent | palm
@@ -413,10 +449,9 @@ func miamiEgg() string {
  |_| /_/   \_\_____|_|  |_|
 
         Miami mode: on
-        Easter egg: Kaan Gümüş
+        Easter egg: Kaan Gumus
 `
 }
-
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "palm:", err)
 	os.Exit(1)
@@ -525,6 +560,11 @@ func runChecks(hosts []string, cfg config) []result {
 			IdleConnTimeout:     30 * time.Second,
 		},
 	}
+	if !cfg.followRedirects {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
 
 	var wg sync.WaitGroup
 	for i := 0; i < cfg.concurrency; i++ {
@@ -588,6 +628,8 @@ func checkHost(host string, cfg config, client *http.Client, resolvers *resolver
 			res.Title = probe.Title
 			res.Server = probe.Server
 			res.Length = probe.Length
+			res.ResponseTimeMS = probe.ResponseTimeMS
+			res.Location = probe.Location
 			if !cfg.takeover {
 				return res
 			}
@@ -806,14 +848,17 @@ func checkHTTP(host string, cfg config, client *http.Client) (httpProbe, error) 
 
 func requestURL(target string, cfg config, client *http.Client) (httpProbe, error) {
 	method := http.MethodHead
-	if cfg.title {
+	autoMethod := cfg.method == ""
+	if cfg.method != "" {
+		method = cfg.method
+	} else if cfg.title {
 		method = http.MethodGet
 	}
 	probe, err := doRequest(target, method, cfg, client)
 	if err != nil {
 		return httpProbe{}, err
 	}
-	if method == http.MethodHead && (probe.StatusCode == http.StatusMethodNotAllowed || probe.StatusCode == http.StatusForbidden) {
+	if autoMethod && method == http.MethodHead && (probe.StatusCode == http.StatusMethodNotAllowed || probe.StatusCode == http.StatusForbidden) {
 		return doRequest(target, http.MethodGet, cfg, client)
 	}
 	return probe, nil
@@ -825,7 +870,15 @@ func doRequest(target, method string, cfg config, client *http.Client) (httpProb
 		return httpProbe{}, err
 	}
 	req.Header.Set("User-Agent", "palm/"+version)
+	for name, values := range cfg.headers {
+		req.Header.Del(name)
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
+	}
+	start := time.Now()
 	resp, err := client.Do(req)
+	elapsed := time.Since(start)
 	if err != nil {
 		return httpProbe{}, err
 	}
@@ -835,6 +888,13 @@ func doRequest(target, method string, cfg config, client *http.Client) (httpProb
 		URL:        resp.Request.URL.String(),
 		StatusCode: resp.StatusCode,
 	}
+	if cfg.responseTime {
+		rt := elapsed.Milliseconds()
+		probe.ResponseTimeMS = &rt
+	}
+	if cfg.location {
+		probe.Location = resp.Header.Get("Location")
+	}
 	if cfg.contentLen && resp.ContentLength >= 0 {
 		length := resp.ContentLength
 		probe.Length = &length
@@ -842,7 +902,7 @@ func doRequest(target, method string, cfg config, client *http.Client) (httpProb
 	if cfg.server {
 		probe.Server = resp.Header.Get("Server")
 	}
-	if cfg.title && method == http.MethodGet {
+	if cfg.title && method != http.MethodHead {
 		probe.Title = readTitle(resp.Body)
 	}
 	return probe, nil
@@ -952,6 +1012,12 @@ func formatHTTPResult(res result, cfg config) string {
 	}
 	if cfg.contentLen && res.Length != nil {
 		parts = append(parts, "cl="+strconv.FormatInt(*res.Length, 10))
+	}
+	if cfg.responseTime && res.ResponseTimeMS != nil {
+		parts = append(parts, "rt="+strconv.FormatInt(*res.ResponseTimeMS, 10)+"ms")
+	}
+	if cfg.location && res.Location != "" {
+		parts = append(parts, "location="+res.Location)
 	}
 	if res.Takeover {
 		parts = append(parts, "takeover="+res.Provider)

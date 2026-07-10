@@ -69,6 +69,7 @@ Release binaries are generated automatically when a `v*` tag is pushed.
 palm subs.txt
 palm subs.txt -status
 palm subs.txt -mc 200,301,302 -title -server
+palm subs.txt -rt -location -follow-redirects=false
 palm subs.txt -takeover
 palm subs.txt -mode dns -status
 palm subs.txt -mode both -json -o live.jsonl
@@ -128,6 +129,18 @@ Add lightweight HTTP metadata:
 palm subs.txt -status -title -server -cl
 ```
 
+Show response timing and redirect targets:
+
+```bash
+palm subs.txt -status -rt -location -follow-redirects=false
+```
+
+Send custom methods or headers:
+
+```bash
+palm subs.txt -method GET -H "User-Agent: palm-recon" -H "X-Recon: palm"
+```
+
 Use your own DNS resolvers:
 
 ```bash
@@ -163,6 +176,11 @@ Only scan domains and infrastructure you own or have permission to test. `palm` 
 -title             include page title
 -server            include server header
 -cl                include content length
+-rt                include response time
+-location          include redirect Location header
+-follow-redirects  follow HTTP redirects (default true)
+-method string     HTTP method
+-H string          custom HTTP header, repeatable
 -takeover          check subdomain takeover fingerprints
 -q                 only print live hosts/URLs
 -tools             show common tool pipelines
