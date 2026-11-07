@@ -23,12 +23,22 @@
     throw ile bildirilir ve PowerShell oturumu kapanmaz.
 #>
 param(
-    [string]$InstallDir = $(if ($env:PALM_INSTALL_DIR) { $env:PALM_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\palm' }),
+    [string]$InstallDir = '',
     [string]$Version = 'latest'
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+# Parametre verilmediyse ortam degiskeni ya da varsayilan konum kullanilir.
+# (param() icinde $(if ...) kullanilamaz: 'irm | iex' ile parse hatasi verir.)
+if (-not $InstallDir) {
+    $InstallDir = if ($env:PALM_INSTALL_DIR) {
+        $env:PALM_INSTALL_DIR
+    } else {
+        Join-Path $env:LOCALAPPDATA 'Programs\palm'
+    }
+}
 
 $repo = 'kaaangumus/palm'
 $binName = 'palm.exe'
