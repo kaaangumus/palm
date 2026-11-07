@@ -58,17 +58,17 @@ jobs:
           }
           Write-Host 'install.ps1 sozdizimi OK'
 
-      - name: install.ps1 must stay ASCII with BOM
+      - name: install.ps1 must stay ASCII without BOM
         shell: pwsh
         run: |
           $bytes = [System.IO.File]::ReadAllBytes((Join-Path $PWD 'install.ps1'))
-          if (-not ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)) {
-            Write-Error 'install.ps1 UTF-8 BOM ile kaydedilmeli (Windows PowerShell 5.1 uyumu).'
+          if ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            Write-Error 'install.ps1 BOM icermemeli: "irm | iex" BOM u ilk komutun parcasi sanip hata basar.'
             exit 1
           }
-          $nonAscii = $bytes[3..($bytes.Length - 1)] | Where-Object { $_ -gt 0x7F }
+          $nonAscii = $bytes | Where-Object { $_ -gt 0x7F }
           if ($nonAscii) {
             Write-Error 'install.ps1 ASCII disi karakter iceriyor; Windows PowerShell 5.1 bunu bozar.'
             exit 1
           }
-          Write-Host 'install.ps1 ASCII + BOM OK'
+          Write-Host 'install.ps1 ASCII + BOM yok: OK'
