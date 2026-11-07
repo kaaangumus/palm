@@ -58,7 +58,44 @@ It intentionally does not try to be a screenshot tool, technology detector, WAF/
 
 ## Install
 
-Recommended Linux/macOS install:
+### Windows (one command)
+
+PowerShell (no admin rights needed):
+
+```powershell
+irm https://raw.githubusercontent.com/kaaangumus/palm/main/install.ps1 | iex
+```
+
+The installer downloads `palm_windows_<arch>.exe` from the latest release, installs it to
+`%LOCALAPPDATA%\Programs\palm`, and adds that folder to your user `PATH`. Open a new
+terminal and run:
+
+```powershell
+palm -version
+```
+
+Custom install folder, or a specific version:
+
+```powershell
+# custom folder
+$env:PALM_INSTALL_DIR = "$HOME\bin"; irm https://raw.githubusercontent.com/kaaangumus/palm/main/install.ps1 | iex
+
+# pinned version
+.\install.ps1 -Version v0.3.0
+```
+
+If script execution is blocked in your session, run it with a one-off policy override
+instead of changing the machine setting:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/kaaangumus/palm/main/install.ps1 | iex"
+```
+
+To uninstall, delete `%LOCALAPPDATA%\Programs\palm` and remove that entry from your user `PATH`.
+
+### Linux / macOS
+
+Recommended install:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kaaangumus/palm/main/install.sh | sh
@@ -82,7 +119,7 @@ Install without sudo:
 curl -fsSL https://raw.githubusercontent.com/kaaangumus/palm/main/install.sh | PALM_INSTALL_DIR="$HOME/.local/bin" sh
 ```
 
-Install with Go:
+### Go
 
 ```bash
 go install github.com/kaaangumus/palm@latest
@@ -108,6 +145,12 @@ Build a Linux binary from another system:
 GOOS=linux GOARCH=amd64 go build -o palm .
 ```
 
+Build a Windows binary from another system:
+
+```bash
+GOOS=windows GOARCH=amd64 go build -o palm.exe .
+```
+
 Release binaries are generated automatically when a `v*` tag is pushed.
 
 Update later:
@@ -131,7 +174,7 @@ subfinder -d example.com -silent | palm -mode dns -status -o resolved.txt
 subfinder -d example.com -silent | palm -json -status -title -server -o live.jsonl
 ```
 
-Default mode is `http`, so palm prints live `https://` or `http://` URLs.
+Default mode is `both`, so palm resolves each host with DNS first and then prints live `https://` or `http://` URLs for hosts that pass both checks.
 
 ## Bug Bounty Workflow
 
@@ -238,7 +281,7 @@ palm subs.txt -takeover
 palm subs.txt -takeover -json
 ```
 
-`-takeover` checks CNAME targets and known provider error fingerprints. Treat matches as takeover risk findings that should be manually verified before reporting.
+`-takeover` checks CNAME targets and known provider error fingerprints. `-json` records the resolved `cname` for every checked host, even when no fingerprint matches, so you can review dangling targets manually. Treat matches as takeover risk findings that should be manually verified before reporting.
 
 ## Responsible Use
 
@@ -249,10 +292,10 @@ Only scan domains and infrastructure you own or have permission to test. `palm` 
 ```text
 -l, -list string   subdomain list file
 -o string          output file
--mode string       dns, http, both (default "http")
+-mode string       dns, http, both (default "both")
 -r string          resolver file for DNS lookups
 -c int             concurrent workers (default 100)
--timeout int       timeout in seconds (default 5)
+-timeout int       timeout in seconds per phase (DNS, HTTP) (default 5)
 -mc string         match HTTP status codes, comma-separated
 -fc string         filter HTTP status codes, comma-separated
 -json              write JSON lines
@@ -266,7 +309,7 @@ Only scan domains and infrastructure you own or have permission to test. `palm` 
 -method string     HTTP method
 -H string          custom HTTP header, repeatable
 -takeover          check subdomain takeover fingerprints
--q                 only print live hosts/URLs
+-q                 only print live URLs, bare and pipe-friendly
 -tools             show common tool pipelines
 -check-update      check latest GitHub release
 -update            update palm with go install
@@ -292,7 +335,24 @@ https://app.example.com
 http://dev.example.com
 ```
 
-With status:
+With status (default `both` mode also shows resolved IPs):
+
+```text
+https://api.example.com [200 | ip=104.20.23.154]
+https://app.example.com [302 | ip=172.66.147.243]
+```
+
+With a cross-host redirect (default `-follow-redirects`), the probed subdomain stays first and the final URL is added as `final=`:
+
+```text
+https://0b295af.sites.google.com [200 | final=https://accounts.google.com/ServiceLogin?...]
+```
+
+`-title` only reports a title when the final page is served by the same host. A login page from another host is not attributed to the subdomain; follow `final=` instead.
+
+`-timeout` is a budget per phase: the DNS lookup gets one budget, and the HTTP phase shares one budget across the HTTPS and HTTP attempts, so a slow host cannot cost `2 x -timeout`.
+
+With status in `http` mode:
 
 ```text
 https://api.example.com [200]
@@ -308,7 +368,7 @@ api.example.com 104.20.23.154,172.66.147.243
 JSON lines:
 
 ```json
-{"host":"api.example.com","live":true,"dns":true,"ips":["104.20.23.154"],"url":"https://api.example.com","status_code":200}
+{"host":"www.github.com","live":true,"dns":true,"ips":["140.82.121.3"],"url":"https://github.com/","probed_url":"https://www.github.com","status_code":200}
 ```
 
 ## Easter Egg

@@ -34,3 +34,41 @@ jobs:
 
       - name: Build
         run: go build -o palm .
+
+  installer-scripts:
+    name: Installer scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Shell syntax (install.sh)
+        run: sh -n install.sh
+
+      - name: PowerShell syntax (install.ps1)
+        shell: pwsh
+        run: |
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD 'install.ps1'), [ref]$null, [ref]$errors
+          )
+          if ($errors) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+          Write-Host 'install.ps1 sozdizimi OK'
+
+      - name: install.ps1 must stay ASCII with BOM
+        shell: pwsh
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes((Join-Path $PWD 'install.ps1'))
+          if (-not ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)) {
+            Write-Error 'install.ps1 UTF-8 BOM ile kaydedilmeli (Windows PowerShell 5.1 uyumu).'
+            exit 1
+          }
+          $nonAscii = $bytes[3..($bytes.Length - 1)] | Where-Object { $_ -gt 0x7F }
+          if ($nonAscii) {
+            Write-Error 'install.ps1 ASCII disi karakter iceriyor; Windows PowerShell 5.1 bunu bozar.'
+            exit 1
+          }
+          Write-Host 'install.ps1 ASCII + BOM OK'
