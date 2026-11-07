@@ -12,36 +12,30 @@
 
 .EXAMPLE
     # Kurulum klasorunu degistirmek icin
-    $env:PALM_INSTALL_DIR = "$HOME\bin"; irm https://raw.githubusercontent.com/kaaangumus/palm/main/install.ps1 | iex
+    $env:PALM_INSTALL_DIR = "$HOME\bin"
+    irm https://raw.githubusercontent.com/kaaangumus/palm/main/install.ps1 | iex
 
 .EXAMPLE
     # Belirli bir surumu kurmak icin
-    .\install.ps1 -Version v0.3.0
+    $env:PALM_VERSION = "v0.3.0"
+    irm https://raw.githubusercontent.com/kaaangumus/palm/main/install.ps1 | iex
 
 .NOTES
-    'irm | iex' ile calisirken 'exit' kullanilmaz; bu yuzden hatalar
-    throw ile bildirilir ve PowerShell oturumu kapanmaz.
+    Bu script 'irm ... | iex' ile calisacak sekilde yazildi:
+      - 'param()' blogu kullanilmaz (pipeline girdisinde parse hatasi verir).
+        Yapilandirma PALM_INSTALL_DIR / PALM_VERSION ortam degiskenleriyle yapilir.
+      - 'exit' cagrilmaz; aksi halde kullanicinin PowerShell oturumu kapanir.
+        Hatalar throw ile bildirilir.
 #>
-param(
-    [string]$InstallDir = '',
-    [string]$Version = 'latest'
-)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-# Parametre verilmediyse ortam degiskeni ya da varsayilan konum kullanilir.
-# (param() icinde $(if ...) kullanilamaz: 'irm | iex' ile parse hatasi verir.)
-if (-not $InstallDir) {
-    $InstallDir = if ($env:PALM_INSTALL_DIR) {
-        $env:PALM_INSTALL_DIR
-    } else {
-        Join-Path $env:LOCALAPPDATA 'Programs\palm'
-    }
-}
-
 $repo = 'kaaangumus/palm'
 $binName = 'palm.exe'
+
+$InstallDir = if ($env:PALM_INSTALL_DIR) { $env:PALM_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\palm' }
+$Version    = if ($env:PALM_VERSION) { $env:PALM_VERSION } else { 'latest' }
 
 function Write-Step([string]$Message) { Write-Host "==> $Message" -ForegroundColor Cyan }
 function Write-Ok([string]$Message) { Write-Host "  ok  $Message" -ForegroundColor Green }
@@ -103,12 +97,8 @@ function Save-Binary([string]$url, [string]$destination) {
             }
         } catch { }
 
-        if ($status -eq 404) {
-            throw "dosya bulunamadi (HTTP 404): $url"
-        }
-        if ($status) {
-            throw "indirme basarisiz (HTTP $status): $url"
-        }
+        if ($status -eq 404) { throw "dosya bulunamadi (HTTP 404): $url" }
+        if ($status) { throw "indirme basarisiz (HTTP $status): $url" }
         throw "indirme basarisiz: $($_.Exception.Message)"
     }
 }
@@ -148,7 +138,7 @@ function Add-ToUserPath([string]$directory) {
     }
 }
 
-# -- kurulum ----------------------------------------------------------------
+# -- kurulum ---------------------------------------------------------------
 Write-Host ''
 Write-Host '  palm - Windows kurulum' -ForegroundColor White
 Write-Host ''
@@ -210,7 +200,7 @@ try {
     Write-Host ''
     Write-Host '  Kurulum tamam.' -ForegroundColor Green
     Write-Host '  Yeni bir terminal actiginizda "palm" komutu hazir olur.' -ForegroundColor Gray
-    Write-Host '  Bu oturumda kullanmak icin zaten PATH eklendi; dogrudan deneyin: palm -help' -ForegroundColor Gray
+    Write-Host '  Bu oturumda kullanmak icin PATH zaten eklendi; dogrudan deneyin: palm -help' -ForegroundColor Gray
     Write-Host ''
 } catch {
     Write-Host ''

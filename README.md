@@ -74,14 +74,17 @@ terminal and run:
 palm -version
 ```
 
-Custom install folder, or a specific version:
+Custom install folder or a pinned version (the script reads environment variables, because
+`irm | iex` cannot take PowerShell parameters):
 
 ```powershell
 # custom folder
-$env:PALM_INSTALL_DIR = "$HOME\bin"; irm https://raw.githubusercontent.com/kaaangumus/palm/main/install.ps1 | iex
+$env:PALM_INSTALL_DIR = "$HOME\bin"
+irm https://raw.githubusercontent.com/kaaangumus/palm/main/install.ps1 | iex
 
 # pinned version
-.\install.ps1 -Version v0.3.0
+$env:PALM_VERSION = "v0.3.0"
+irm https://raw.githubusercontent.com/kaaangumus/palm/main/install.ps1 | iex
 ```
 
 If script execution is blocked in your session, run it with a one-off policy override
