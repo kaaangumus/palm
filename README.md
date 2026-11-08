@@ -286,7 +286,36 @@ palm subs.txt -takeover -json
 
 `-takeover` checks CNAME targets and known provider error fingerprints. `-json` records the resolved `cname` for every checked host, even when no fingerprint matches, so you can review dangling targets manually. Treat matches as takeover risk findings that should be manually verified before reporting.
 
-## Responsible Use
+Inspect TLS certificates:
+
+```bash
+palm subs.txt -tls -status
+palm subs.txt -tls -json -o certs.jsonl
+```
+
+`-tls` reports the leaf certificate issuer, expiry, and whether the certificate covers the host it was presented for. The request itself still accepts self-signed and expired certificates, so a host with a broken certificate is still reported as live; `tls_mismatch` marks a certificate that does not cover its hostname.
+
+Handle wildcard DNS:
+
+```bash
+palm subs.txt -wildcard -status
+palm subs.txt -wildcard -fw
+```
+
+A wildcard DNS record makes every invented subdomain resolve, which pollutes recon results. `-wildcard` resolves one random name per parent domain and marks hosts that resolve to the same addresses (`wildcard` in text, `"wildcard":true` in JSON). `-fw` drops them. Detection compares addresses only, so a host behind a shared CDN can be marked even when it is real; verify before discarding.
+
+## Performance
+
+Each host is probed once, but palm does not wait for HTTPS before trying HTTP:
+
+- Both `https://` and `http://` are probed in parallel under one `-timeout` budget, so a host that blackholes port 443 still gets its HTTP chance, and a host that only answers over HTTP is found in one timeout instead of two.
+- HTTPS is still preferred: when both answer, the HTTPS result wins after a short grace window.
+- HTTP/2 stays enabled even though certificate verification is skipped, so h2 sites only need one connection.
+- A failed `HEAD` (a server that hangs up or resets) is retried once with `GET`, which recovers sites that reject HEAD.
+- `-title` stops reading as soon as `</title>` is seen instead of downloading the whole capped body.
+
+On a 900-host corpus, the median gain is small for hosts that answer quickly and large for slow or mixed hosts (roughly 30% faster at `-c 300`).
+
 
 Only scan domains and infrastructure you own or have permission to test. `palm` is built for authorized recon workflows.
 
@@ -312,6 +341,9 @@ Only scan domains and infrastructure you own or have permission to test. `palm` 
 -method string     HTTP method
 -H string          custom HTTP header, repeatable
 -takeover          check subdomain takeover fingerprints
+-tls               include TLS certificate summary
+-wildcard          detect wildcard DNS and mark matching hosts
+-fw                drop hosts that match a wildcard DNS record
 -q                 only print live URLs, bare and pipe-friendly
 -tools             show common tool pipelines
 -check-update      check latest GitHub release
@@ -351,7 +383,7 @@ With a cross-host redirect (default `-follow-redirects`), the probed subdomain s
 https://0b295af.sites.google.com [200 | final=https://accounts.google.com/ServiceLogin?...]
 ```
 
-`-title` only reports a title when the final page is served by the same host. A login page from another host is not attributed to the subdomain; follow `final=` instead.
+`-title` only reports a title when the final page is served by the same site: the same hostname, or a `www.` ↔ apex redirect. A login page from another host is not attributed to the subdomain; follow `final=` instead.
 
 `-timeout` is a budget per phase: the DNS lookup gets one budget, and the HTTP phase shares one budget across the HTTPS and HTTP attempts, so a slow host cannot cost `2 x -timeout`.
 

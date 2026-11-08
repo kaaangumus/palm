@@ -3,12 +3,16 @@ package main
 import (
 	"bufio"
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,7 +26,7 @@ import (
 	"time"
 )
 
-const version = "0.3.0"
+const version = "0.5.0"
 const modulePath = "github.com/kaaangumus/palm"
 const latestReleaseURL = "https://api.github.com/repos/kaaangumus/palm/releases/latest"
 
@@ -45,6 +49,9 @@ type config struct {
 	headers         http.Header
 	takeover        bool
 	quiet           bool
+	tlsInfo         bool
+	wildcard        bool
+	filterWildcard  bool
 	matchCodes      map[int]struct{}
 	filterCodes     map[int]struct{}
 }
@@ -55,6 +62,7 @@ type result struct {
 	DNS            bool     `json:"dns"`
 	IPs            []string `json:"ips,omitempty"`
 	URL            string   `json:"url,omitempty"`
+	ProbedURL      string   `json:"probed_url,omitempty"`
 	StatusCode     int      `json:"status_code,omitempty"`
 	Title          string   `json:"title,omitempty"`
 	Server         string   `json:"server,omitempty"`
@@ -64,17 +72,27 @@ type result struct {
 	Takeover       bool     `json:"takeover,omitempty"`
 	Provider       string   `json:"takeover_provider,omitempty"`
 	CNAME          string   `json:"cname,omitempty"`
+	Wildcard       bool     `json:"wildcard,omitempty"`
+	TLSIssuer      string   `json:"tls_issuer,omitempty"`
+	TLSExpires     string   `json:"tls_expires,omitempty"`
+	TLSDaysLeft    *int     `json:"tls_days_left,omitempty"`
+	TLSMismatch    bool     `json:"tls_mismatch,omitempty"`
 	Error          string   `json:"error,omitempty"`
 }
 
 type httpProbe struct {
 	URL            string
+	FinalURL       string
 	StatusCode     int
 	Title          string
 	Server         string
 	Length         *int64
 	ResponseTimeMS *int64
 	Location       string
+	TLSIssuer      string
+	TLSExpires     string
+	TLSDaysLeft    *int
+	TLSMismatch    bool
 }
 
 type releaseInfo struct {
@@ -94,14 +112,114 @@ func (h *headerFlags) Set(value string) error {
 }
 
 type resolverPool struct {
-	addrs []string
-	next  uint64
+	addrs     []string
+	resolvers []*net.Resolver
+	next      uint64
 }
 
 type takeoverFingerprint struct {
 	Provider string
 	CNAMEs   []string
 	Bodies   []string
+}
+
+type wildcardCache struct {
+	pool    *resolverPool
+	timeout time.Duration
+	mu      sync.Mutex
+	entries map[string]*wildcardEntry
+}
+
+type wildcardEntry struct {
+	once sync.Once
+	ips  []string
+}
+
+func newWildcardCache(pool *resolverPool, timeout time.Duration) *wildcardCache {
+	return &wildcardCache{pool: pool, timeout: timeout, entries: make(map[string]*wildcardEntry)}
+}
+
+func (w *wildcardCache) entry(parent string) *wildcardEntry {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	e, ok := w.entries[parent]
+	if !ok {
+		e = &wildcardEntry{}
+		w.entries[parent] = e
+	}
+	return e
+}
+
+// matches reports whether a resolvable random name under the host's parent
+// domain resolves to an address the host also uses, which means the name exists
+// because of a wildcard record rather than a real subdomain.
+func (w *wildcardCache) matches(ips []string, host string) bool {
+	if w == nil || len(ips) == 0 {
+		return false
+	}
+	parent := parentDomain(host)
+	if parent == "" {
+		return false
+	}
+	e := w.entry(parent)
+	e.once.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), w.timeout)
+		defer cancel()
+		random := randomLabel() + "." + parent
+		if resolved, err := lookupHostWithCtx(ctx, random, w.pool); err == nil {
+			e.ips = resolved
+		}
+	})
+	return ipSetsOverlap(ips, e.ips)
+}
+
+func randomLabel() string {
+	var raw [8]byte
+	if _, err := cryptorand.Read(raw[:]); err != nil {
+		return "palm-wildcard-probe"
+	}
+	return "palm" + hex.EncodeToString(raw[:])
+}
+
+// parentDomain returns the registrable-ish parent used for a wildcard probe.
+// It is a heuristic (no public suffix list): aaa.bbb.example.com -> example.com
+// and aaa.bbb.example.co.uk -> example.co.uk.
+func parentDomain(host string) string {
+	labels := strings.Split(host, ".")
+	if len(labels) < 3 {
+		return ""
+	}
+	keep := 2
+	tld := labels[len(labels)-1]
+	second := labels[len(labels)-2]
+	if len(tld) == 2 && len(labels) >= 4 && isCommonSecondLevel(second) {
+		keep = 3
+	}
+	return strings.Join(labels[len(labels)-keep:], ".")
+}
+
+func isCommonSecondLevel(label string) bool {
+	switch label {
+	case "co", "com", "net", "org", "gov", "ac", "edu", "or", "ne", "go", "mil", "sch":
+		return true
+	}
+	return false
+}
+
+func ipSetsOverlap(a, b []string) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	set := make(map[string]struct{}, len(b))
+	for _, ip := range b {
+		set[ip] = struct{}{}
+	}
+	for _, ip := range a {
+		if _, ok := set[ip]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 var takeoverFingerprints = []takeoverFingerprint{
@@ -118,6 +236,11 @@ var takeoverFingerprints = []takeoverFingerprint{
 }
 
 func main() {
+	// Go's HTTP transport can log noisy "Unsolicited response received on idle
+	// HTTP channel" lines to stderr. palm has no logging of its own, so keep the
+	// stream clean for pipelines.
+	log.SetOutput(io.Discard)
+
 	cfg, err := parseFlags(os.Args[1:])
 	if err != nil {
 		fatal(err)
@@ -141,7 +264,10 @@ func main() {
 	}
 	defer closeOut()
 
-	results := runChecks(hosts, cfg)
+	results, err := runChecks(hosts, cfg)
+	if err != nil {
+		fatal(err)
+	}
 	writeResults(out, results, cfg)
 }
 
@@ -153,10 +279,10 @@ func parseFlags(args []string) (config, error) {
 	fs.StringVar(&cfg.inputFile, "l", "", "subdomain list file")
 	fs.StringVar(&cfg.inputFile, "list", "", "subdomain list file")
 	fs.StringVar(&cfg.outputFile, "o", "", "output file")
-	fs.StringVar(&cfg.mode, "mode", "http", "check mode: dns, http, both")
+	fs.StringVar(&cfg.mode, "mode", "both", "check mode: dns, http, both")
 	fs.StringVar(&cfg.resolverFile, "r", "", "resolver file for DNS lookups")
 	fs.IntVar(&cfg.concurrency, "c", 100, "concurrent workers")
-	timeout := fs.Int("timeout", 5, "timeout in seconds")
+	timeout := fs.Int("timeout", 5, "timeout in seconds per phase (DNS, HTTP)")
 	matchCodes := fs.String("mc", "", "match HTTP status codes")
 	filterCodes := fs.String("fc", "", "filter HTTP status codes")
 	var headers headerFlags
@@ -171,6 +297,9 @@ func parseFlags(args []string) (config, error) {
 	fs.StringVar(&cfg.method, "method", "", "HTTP method")
 	fs.Var(&headers, "H", "custom HTTP header, repeatable")
 	fs.BoolVar(&cfg.takeover, "takeover", false, "check subdomain takeover fingerprints")
+	fs.BoolVar(&cfg.tlsInfo, "tls", false, "include TLS certificate summary")
+	fs.BoolVar(&cfg.wildcard, "wildcard", false, "detect wildcard DNS and mark matching hosts")
+	fs.BoolVar(&cfg.filterWildcard, "fw", false, "drop hosts that match a wildcard DNS record")
 	fs.BoolVar(&cfg.quiet, "q", false, "only print live hosts/URLs")
 	showHelp := fs.Bool("h", false, "show help")
 	showVersion := fs.Bool("version", false, "show version")
@@ -426,10 +555,10 @@ Usage:
 Flags:
   -l, -list string   subdomain list file
   -o string          output file
-  -mode string       dns, http, both (default "http")
+  -mode string       dns, http, both (default "both")
   -r string          resolver file for DNS lookups
   -c int             concurrent workers (default 100)
-  -timeout int       timeout in seconds (default 5)
+  -timeout int       timeout in seconds per phase (DNS, HTTP) (default 5)
   -mc string         match HTTP status codes, comma-separated
   -fc string         filter HTTP status codes, comma-separated
   -json              write JSON lines
@@ -443,7 +572,10 @@ Flags:
   -method string     HTTP method
   -H string          custom HTTP header, repeatable
   -takeover          check subdomain takeover fingerprints
-  -q                 only print live hosts/URLs
+  -tls               include TLS certificate summary
+  -wildcard          detect wildcard DNS and mark matching hosts
+  -fw                drop hosts that match a wildcard DNS record
+  -q                 only print live URLs, bare and pipe-friendly
   -tools             show common tool pipelines
   -check-update      check latest GitHub release
   -update            update palm with go install
@@ -466,10 +598,10 @@ Kullanim:
 Parametreler:
   -l, -list string   subdomain liste dosyasi
   -o string          cikti dosyasi
-  -mode string       kontrol modu: dns, http, both (varsayilan "http")
+  -mode string       kontrol modu: dns, http, both (varsayilan "both")
   -r string          DNS sorgulari icin resolver dosyasi
   -c int             eszamanli worker sayisi (varsayilan 100)
-  -timeout int       saniye cinsinden timeout (varsayilan 5)
+  -timeout int       asama basina saniye cinsinden timeout: DNS, HTTP (varsayilan 5)
   -mc string         eslesecek HTTP status kodlari, virgulle ayrilir
   -fc string         filtrelenecek HTTP status kodlari, virgulle ayrilir
   -json              JSON lines formatinda yaz
@@ -483,7 +615,10 @@ Parametreler:
   -method string     HTTP method
   -H string          custom HTTP header, tekrar edilebilir
   -takeover          subdomain takeover fingerprint kontrolu yap
-  -q                 sadece live host/URL yaz
+  -tls               TLS sertifika ozetini goster
+  -wildcard          wildcard DNS tespit et ve eslesen hostlari isaretle
+  -fw                wildcard DNS kaydiyla eslesen hostlari ele
+  -q                 sadece live URL yaz, sade ve pipe dostu
   -tools             yaygin araclarla ornek pipeline goster
   -check-update      en son GitHub release surumunu kontrol et
   -update            go install ile palm'i guncelle
@@ -553,6 +688,9 @@ func readHosts(path string, stdin io.Reader) ([]string, error) {
 	if path != "" {
 		f, err := os.Open(path)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("%w (to scan a single host, pipe it in: echo host | palm)", err)
+			}
 			return nil, err
 		}
 		defer f.Close()
@@ -594,7 +732,7 @@ func normalizeHost(line string) string {
 	if len(fields) == 0 {
 		return ""
 	}
-	raw := strings.Trim(fields[0], " ,;[](){}\"'")
+	raw := strings.Trim(fields[0], " ,;(){}'\"")
 	if raw == "" {
 		return ""
 	}
@@ -609,6 +747,8 @@ func normalizeHost(line string) string {
 	raw = strings.TrimSuffix(raw, ".")
 	if host, _, err := net.SplitHostPort(raw); err == nil {
 		raw = host
+	} else if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		raw = raw[1 : len(raw)-1]
 	}
 	raw = strings.Trim(strings.ToLower(raw), " .")
 	if raw == "" || strings.ContainsAny(raw, `/\`) {
@@ -631,18 +771,26 @@ func outputWriter(path string) (io.Writer, func(), error) {
 	return f, func() { _ = f.Close() }, nil
 }
 
-func runChecks(hosts []string, cfg config) []result {
+func runChecks(hosts []string, cfg config) ([]result, error) {
 	resolvers, err := loadResolverPool(cfg.resolverFile)
 	if err != nil {
-		return []result{{Error: err.Error()}}
+		return nil, err
 	}
 	jobs := make(chan string)
 	results := make(chan result)
+
+	var wildcards *wildcardCache
+	if cfg.wildcard || cfg.filterWildcard {
+		wildcards = newWildcardCache(resolvers, cfg.timeout)
+	}
 
 	client := &http.Client{
 		Timeout: cfg.timeout,
 		Transport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
+			// Setting a custom TLSClientConfig disables Go's automatic HTTP/2
+			// upgrade; ForceAttemptHTTP2 keeps h2 for hosts that support it.
+			ForceAttemptHTTP2: true,
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: true,
 			},
@@ -663,7 +811,7 @@ func runChecks(hosts []string, cfg config) []result {
 		go func() {
 			defer wg.Done()
 			for host := range jobs {
-				results <- checkHost(host, cfg, client, resolvers)
+				results <- checkHost(host, cfg, client, resolvers, wildcards)
 			}
 		}()
 	}
@@ -677,7 +825,7 @@ func runChecks(hosts []string, cfg config) []result {
 		close(results)
 	}()
 
-	return collectResults(results)
+	return collectResults(results), nil
 }
 
 func collectResults(results <-chan result) []result {
@@ -691,7 +839,7 @@ func collectResults(results <-chan result) []result {
 	return out
 }
 
-func checkHost(host string, cfg config, client *http.Client, resolvers *resolverPool) result {
+func checkHost(host string, cfg config, client *http.Client, resolvers *resolverPool, wildcards *wildcardCache) result {
 	res := result{Host: host}
 
 	if cfg.mode == "dns" || cfg.mode == "both" {
@@ -700,27 +848,36 @@ func checkHost(host string, cfg config, client *http.Client, resolvers *resolver
 			res.DNS = true
 			res.IPs = ips
 			res.Live = true
-		} else if cfg.mode == "dns" {
+			if wildcards != nil && wildcards.matches(ips, host) {
+				res.Wildcard = true
+			}
+		} else {
 			res.Error = shortErr(err)
+			res.Live = false
 			return res
 		}
 	}
 
 	if cfg.mode == "http" || cfg.mode == "both" {
-		if cfg.mode == "both" && !res.DNS {
-			res.Live = false
-			return res
-		}
-		probe, err := checkHTTP(host, cfg, client)
+		// Both schemes are probed in parallel under one budget, so a host that
+		// blackholes 443 still gets its HTTP chance within -timeout.
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
+		probe, err := checkHTTP(ctx, host, cfg, client)
+		cancel()
 		if err == nil {
 			res.Live = true
-			res.URL = probe.URL
+			res.URL = probe.FinalURL
+			res.ProbedURL = probe.URL
 			res.StatusCode = probe.StatusCode
 			res.Title = probe.Title
 			res.Server = probe.Server
 			res.Length = probe.Length
 			res.ResponseTimeMS = probe.ResponseTimeMS
 			res.Location = probe.Location
+			res.TLSIssuer = probe.TLSIssuer
+			res.TLSExpires = probe.TLSExpires
+			res.TLSDaysLeft = probe.TLSDaysLeft
+			res.TLSMismatch = probe.TLSMismatch
 			if !cfg.takeover {
 				return res
 			}
@@ -746,7 +903,10 @@ func checkHost(host string, cfg config, client *http.Client, resolvers *resolver
 func lookupHost(host string, timeout time.Duration, resolvers *resolverPool) ([]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	return lookupHostWithCtx(ctx, host, resolvers)
+}
 
+func lookupHostWithCtx(ctx context.Context, host string, resolvers *resolverPool) ([]string, error) {
 	ips, err := resolvers.lookupHost(ctx, host)
 	if err != nil {
 		return nil, err
@@ -763,35 +923,29 @@ func detectTakeover(host string, timeout time.Duration, resolvers *resolverPool,
 	if err != nil || cname == "" {
 		return false, "", ""
 	}
+	return evaluateTakeover(host, cname, client)
+}
+
+// evaluateTakeover keeps the resolved CNAME even when no takeover fingerprint
+// matches, so `-takeover -json` still shows the CNAME chain for manual review.
+func evaluateTakeover(host, cname string, client *http.Client) (bool, string, string) {
 	fingerprint, ok := matchTakeoverCNAME(cname)
 	if !ok {
-		return false, "", ""
+		return false, "", cname
 	}
 
 	body := fetchTakeoverBody(host, client)
 	if body == "" {
-		return false, "", ""
+		return false, "", cname
 	}
 	if matchTakeoverBody(body, fingerprint) {
 		return true, fingerprint.Provider, cname
 	}
-	return false, "", ""
+	return false, "", cname
 }
 
 func lookupCNAME(ctx context.Context, host string, resolvers *resolverPool) (string, error) {
-	if resolvers == nil || len(resolvers.addrs) == 0 {
-		return net.DefaultResolver.LookupCNAME(ctx, host)
-	}
-	idx := atomic.AddUint64(&resolvers.next, 1)
-	addr := resolvers.addrs[int(idx-1)%len(resolvers.addrs)]
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			dialer := &net.Dialer{}
-			return dialer.DialContext(ctx, "udp", addr)
-		},
-	}
-	return resolver.LookupCNAME(ctx, host)
+	return resolvers.lookupCNAME(ctx, host)
 }
 
 func matchTakeoverCNAME(cname string) (takeoverFingerprint, bool) {
@@ -836,6 +990,21 @@ func matchTakeoverBody(body string, fp takeoverFingerprint) bool {
 	return false
 }
 
+func newResolverPool(addrs []string) *resolverPool {
+	resolvers := make([]*net.Resolver, 0, len(addrs))
+	for _, addr := range addrs {
+		addr := addr
+		resolvers = append(resolvers, &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				dialer := &net.Dialer{}
+				return dialer.DialContext(ctx, "udp", addr)
+			},
+		})
+	}
+	return &resolverPool{addrs: addrs, resolvers: resolvers}
+}
+
 func loadResolverPool(path string) (*resolverPool, error) {
 	if path == "" {
 		return nil, nil
@@ -854,7 +1023,7 @@ func loadResolverPool(path string) (*resolverPool, error) {
 	if len(addrs) == 0 {
 		return nil, errors.New("resolver file has no usable resolvers")
 	}
-	return &resolverPool{addrs: addrs}, nil
+	return newResolverPool(addrs), nil
 }
 
 func readRawLines(path string) ([]string, error) {
@@ -905,39 +1074,88 @@ func normalizeResolver(line string) string {
 }
 
 func (p *resolverPool) lookupHost(ctx context.Context, host string) ([]string, error) {
-	if p == nil || len(p.addrs) == 0 {
+	if p == nil || len(p.resolvers) == 0 {
 		return net.DefaultResolver.LookupHost(ctx, host)
 	}
 	idx := atomic.AddUint64(&p.next, 1)
-	addr := p.addrs[int(idx-1)%len(p.addrs)]
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			dialer := &net.Dialer{}
-			return dialer.DialContext(ctx, "udp", addr)
-		},
-	}
-	return resolver.LookupHost(ctx, host)
+	return p.resolvers[int(idx-1)%len(p.resolvers)].LookupHost(ctx, host)
 }
 
-func checkHTTP(host string, cfg config, client *http.Client) (httpProbe, error) {
-	var lastErr error
+func (p *resolverPool) lookupCNAME(ctx context.Context, host string) (string, error) {
+	if p == nil || len(p.resolvers) == 0 {
+		return net.DefaultResolver.LookupCNAME(ctx, host)
+	}
+	idx := atomic.AddUint64(&p.next, 1)
+	return p.resolvers[int(idx-1)%len(p.resolvers)].LookupCNAME(ctx, host)
+}
+
+// schemePreferenceGrace is how long an HTTP result waits for a still-pending
+// HTTPS attempt before it is returned. It keeps HTTPS preferred without paying
+// a full timeout for HTTP-only hosts.
+const schemePreferenceGrace = 250 * time.Millisecond
+
+func checkHTTP(ctx context.Context, host string, cfg config, client *http.Client) (httpProbe, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type outcome struct {
+		probe  httpProbe
+		err    error
+		scheme string
+	}
+
+	ch := make(chan outcome, 2)
 	for _, scheme := range []string{"https", "http"} {
-		target := scheme + "://" + host
-		probe, err := requestURL(target, cfg, client)
-		if err == nil && statusAllowed(probe.StatusCode, cfg) {
-			return probe, nil
-		}
-		if err != nil {
-			lastErr = err
+		scheme := scheme
+		go func() {
+			probe, err := requestURL(ctx, scheme+"://"+host, cfg, client)
+			ch <- outcome{probe: probe, err: err, scheme: scheme}
+		}()
+	}
+
+	var httpOK *outcome
+	var lastErr error
+	var grace <-chan time.Time
+	for i := 0; i < 2; i++ {
+		var out outcome
+		if grace != nil {
+			select {
+			case out = <-ch:
+			case <-grace:
+				// HTTP already answered and HTTPS is still not done.
+				return httpOK.probe, nil
+			}
 		} else {
-			lastErr = fmt.Errorf("status %d did not match filters", probe.StatusCode)
+			out = <-ch
 		}
+
+		if out.err == nil && statusAllowed(out.probe.StatusCode, cfg) {
+			if out.scheme == "https" {
+				return out.probe, nil
+			}
+			httpCopy := out
+			httpOK = &httpCopy
+			grace = time.After(schemePreferenceGrace)
+			continue
+		}
+
+		if out.err != nil {
+			lastErr = out.err
+		} else {
+			lastErr = fmt.Errorf("status %d did not match filters", out.probe.StatusCode)
+		}
+	}
+
+	if httpOK != nil {
+		return httpOK.probe, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no usable response")
 	}
 	return httpProbe{}, lastErr
 }
 
-func requestURL(target string, cfg config, client *http.Client) (httpProbe, error) {
+func requestURL(ctx context.Context, target string, cfg config, client *http.Client) (httpProbe, error) {
 	method := http.MethodHead
 	autoMethod := cfg.method == ""
 	if cfg.method != "" {
@@ -945,18 +1163,37 @@ func requestURL(target string, cfg config, client *http.Client) (httpProbe, erro
 	} else if cfg.title {
 		method = http.MethodGet
 	}
-	probe, err := doRequest(target, method, cfg, client)
+	probe, err := doRequest(ctx, target, method, cfg, client)
 	if err != nil {
+		// Some servers hang up or reset on HEAD. When the method was chosen
+		// automatically and the failure is not a timeout (no budget left to
+		// retry), try GET once before giving up on this scheme.
+		if autoMethod && method == http.MethodHead && !isTimeoutErr(err) {
+			if retry, retryErr := doRequest(ctx, target, http.MethodGet, cfg, client); retryErr == nil {
+				return retry, nil
+			}
+		}
 		return httpProbe{}, err
 	}
 	if autoMethod && method == http.MethodHead && (probe.StatusCode == http.StatusMethodNotAllowed || probe.StatusCode == http.StatusForbidden) {
-		return doRequest(target, http.MethodGet, cfg, client)
+		return doRequest(ctx, target, http.MethodGet, cfg, client)
 	}
 	return probe, nil
 }
 
-func doRequest(target, method string, cfg config, client *http.Client) (httpProbe, error) {
-	req, err := http.NewRequest(method, target, nil)
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func doRequest(ctx context.Context, target, method string, cfg config, client *http.Client) (httpProbe, error) {
+	req, err := http.NewRequestWithContext(ctx, method, target, nil)
 	if err != nil {
 		return httpProbe{}, err
 	}
@@ -976,7 +1213,8 @@ func doRequest(target, method string, cfg config, client *http.Client) (httpProb
 	defer resp.Body.Close()
 
 	probe := httpProbe{
-		URL:        resp.Request.URL.String(),
+		URL:        target,
+		FinalURL:   resp.Request.URL.String(),
 		StatusCode: resp.StatusCode,
 	}
 	if cfg.responseTime {
@@ -993,10 +1231,115 @@ func doRequest(target, method string, cfg config, client *http.Client) (httpProb
 	if cfg.server {
 		probe.Server = resp.Header.Get("Server")
 	}
+	if cfg.tlsInfo && resp.TLS != nil {
+		applyTLSSummary(&probe, resp.TLS, target)
+	}
 	if cfg.title && method != http.MethodHead {
-		probe.Title = readTitle(resp.Body)
+		// With redirects followed, the body belongs to the final URL. Only
+		// attribute a title when the page is still served by the probed host,
+		// otherwise a login page from another host would look like the
+		// subdomain's own title.
+		if sameHost(probe.URL, probe.FinalURL) {
+			probe.Title = readTitle(resp.Body)
+		}
 	}
 	return probe, nil
+}
+
+// applyTLSSummary records the leaf certificate of the probed URL. Validation is
+// intentionally skipped for the request itself (self-signed hosts are common in
+// recon), so the hostname match is checked here and reported separately.
+func applyTLSSummary(probe *httpProbe, state *tls.ConnectionState, target string) {
+	if state == nil || len(state.PeerCertificates) == 0 {
+		return
+	}
+	cert := state.PeerCertificates[0]
+	probe.TLSIssuer = certIssuer(cert)
+	probe.TLSExpires = cert.NotAfter.UTC().Format("2006-01-02")
+	days := int(time.Until(cert.NotAfter).Hours() / 24)
+	probe.TLSDaysLeft = &days
+
+	// The certificate belongs to the connection of the final URL: with redirects
+	// followed, the last hop is the one that presented it.
+	inspected := probe.FinalURL
+	if inspected == "" {
+		inspected = target
+	}
+	host := inspected
+	if u, err := url.Parse(inspected); err == nil {
+		host = u.Hostname()
+	}
+	probe.TLSMismatch = !certMatchesHost(cert, host)
+}
+
+func certIssuer(cert *x509.Certificate) string {
+	if len(cert.Issuer.Organization) > 0 && cert.Issuer.Organization[0] != "" {
+		return cert.Issuer.Organization[0]
+	}
+	return cert.Issuer.CommonName
+}
+
+func certMatchesHost(cert *x509.Certificate, host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if host == "" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		for _, certIP := range cert.IPAddresses {
+			if certIP.Equal(ip) {
+				return true
+			}
+		}
+		return false
+	}
+	if matchCertName(cert.Subject.CommonName, host) {
+		return true
+	}
+	for _, name := range cert.DNSNames {
+		if matchCertName(name, host) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchCertName(pattern, host string) bool {
+	pattern = strings.TrimSuffix(strings.ToLower(pattern), ".")
+	if pattern == "" {
+		return false
+	}
+	if pattern == host {
+		return true
+	}
+	if !strings.HasPrefix(pattern, "*.") {
+		return false
+	}
+	suffix := pattern[1:] // ".example.com"
+	if !strings.HasSuffix(host, suffix) {
+		return false
+	}
+	label := strings.TrimSuffix(host, suffix)
+	return label != "" && !strings.Contains(label, ".")
+}
+
+func sameHost(a, b string) bool {
+	ua, err := url.Parse(a)
+	if err != nil {
+		return false
+	}
+	ub, err := url.Parse(b)
+	if err != nil {
+		return false
+	}
+	ha := strings.ToLower(strings.TrimSuffix(ua.Hostname(), "."))
+	hb := strings.ToLower(strings.TrimSuffix(ub.Hostname(), "."))
+	// Hostname only: an http -> https upgrade keeps the same site, while a
+	// redirect to another hostname is a different site even on a shared port.
+	if ha == hb {
+		return true
+	}
+	// www.example.com -> example.com is the same site, not a foreign page.
+	return ha == "www."+hb || hb == "www."+ha
 }
 
 func statusAllowed(code int, cfg config) bool {
@@ -1010,27 +1353,63 @@ func statusAllowed(code int, cfg config) bool {
 	return ok
 }
 
+// titleReadLimit caps how much of a page palm reads while hunting for a title.
+const titleReadLimit = 256 * 1024
+
+// readTitle streams the body and stops as soon as the title is complete (or the
+// head ends), instead of reading the whole capped body every time.
 func readTitle(r io.Reader) string {
-	data, err := io.ReadAll(io.LimitReader(r, 512*1024))
-	if err != nil {
-		return ""
+	buf := make([]byte, 0, 8192)
+	chunk := make([]byte, 8192)
+	for len(buf) < titleReadLimit {
+		n, err := r.Read(chunk)
+		if n > 0 {
+			buf = append(buf, chunk[:n]...)
+			if title, done := titleFromBuffer(buf); done {
+				return title
+			}
+		}
+		if err != nil {
+			break
+		}
 	}
+	title, _ := titleFromBuffer(buf)
+	return title
+}
+
+// titleFromBuffer reports the title and whether the scan can stop: found the
+// closing tag, or the document head ended without a title.
+func titleFromBuffer(data []byte) (string, bool) {
 	lower := strings.ToLower(string(data))
 	start := strings.Index(lower, "<title")
 	if start < 0 {
-		return ""
+		return "", strings.Contains(lower, "</head>")
 	}
-	start = strings.Index(lower[start:], ">")
-	if start < 0 {
-		return ""
+	open := strings.IndexByte(lower[start:], '>')
+	if open < 0 {
+		return "", false
 	}
-	start += strings.Index(lower, "<title")
-	end := strings.Index(lower[start+1:], "</title>")
+	body := start + open + 1
+	end := strings.Index(lower[body:], "</title>")
 	if end < 0 {
-		return ""
+		return "", strings.Contains(lower[body:], "</head>")
 	}
-	title := string(data[start+1 : start+1+end])
-	return strings.Join(strings.Fields(title), " ")
+	return strings.Join(strings.Fields(string(data[body:body+end])), " "), true
+}
+
+func sameURL(a, b string) bool {
+	ua, err := url.Parse(a)
+	if err != nil {
+		return a == b
+	}
+	ub, err := url.Parse(b)
+	if err != nil {
+		return a == b
+	}
+	if !strings.EqualFold(ua.Host, ub.Host) || ua.RawQuery != ub.RawQuery {
+		return false
+	}
+	return strings.TrimSuffix(ua.Path, "/") == strings.TrimSuffix(ub.Path, "/")
 }
 
 func shortErr(err error) string {
@@ -1047,6 +1426,9 @@ func shortErr(err error) string {
 func writeResults(w io.Writer, results []result, cfg config) {
 	enc := json.NewEncoder(w)
 	for _, res := range results {
+		if cfg.filterWildcard && res.Wildcard {
+			continue
+		}
 		if cfg.quiet && !res.Live {
 			continue
 		}
@@ -1059,6 +1441,11 @@ func writeResults(w io.Writer, results []result, cfg config) {
 			continue
 		}
 
+		if cfg.quiet {
+			fmt.Fprintln(w, resultURL(res))
+			continue
+		}
+
 		switch cfg.mode {
 		case "dns":
 			fmt.Fprintln(w, formatDNSResult(res, cfg))
@@ -1068,11 +1455,24 @@ func writeResults(w io.Writer, results []result, cfg config) {
 	}
 }
 
+func resultURL(res result) string {
+	if res.ProbedURL != "" {
+		return res.ProbedURL
+	}
+	if res.URL != "" {
+		return res.URL
+	}
+	return res.Host
+}
+
 func formatDNSResult(res result, cfg config) string {
 	value := res.Host
 	var parts []string
 	if cfg.status && len(res.IPs) > 0 {
 		parts = append(parts, strings.Join(res.IPs, ","))
+	}
+	if res.Wildcard {
+		parts = append(parts, "wildcard")
 	}
 	if res.Takeover {
 		parts = append(parts, "takeover="+res.Provider)
@@ -1087,13 +1487,22 @@ func formatDNSResult(res result, cfg config) string {
 }
 
 func formatHTTPResult(res result, cfg config) string {
-	value := res.URL
+	value := res.ProbedURL
+	if value == "" {
+		value = res.URL
+	}
 	if value == "" {
 		value = res.Host
 	}
 	var parts []string
 	if cfg.status && res.StatusCode > 0 {
 		parts = append(parts, strconv.Itoa(res.StatusCode))
+	}
+	if cfg.status && len(res.IPs) > 0 {
+		parts = append(parts, "ip="+strings.Join(res.IPs, ","))
+	}
+	if res.URL != "" && res.ProbedURL != "" && !sameURL(res.ProbedURL, res.URL) {
+		parts = append(parts, "final="+res.URL)
 	}
 	if cfg.title && res.Title != "" {
 		parts = append(parts, "title="+res.Title)
@@ -1109,6 +1518,23 @@ func formatHTTPResult(res result, cfg config) string {
 	}
 	if cfg.location && res.Location != "" {
 		parts = append(parts, "location="+res.Location)
+	}
+	if cfg.tlsInfo && res.TLSIssuer != "" {
+		detail := res.TLSIssuer
+		if res.TLSDaysLeft != nil {
+			if *res.TLSDaysLeft < 0 {
+				detail += " expired"
+			} else {
+				detail += fmt.Sprintf(" %dd", *res.TLSDaysLeft)
+			}
+		}
+		parts = append(parts, "tls="+detail)
+	}
+	if cfg.tlsInfo && res.TLSMismatch {
+		parts = append(parts, "tls_mismatch")
+	}
+	if res.Wildcard {
+		parts = append(parts, "wildcard")
 	}
 	if res.Takeover {
 		parts = append(parts, "takeover="+res.Provider)
