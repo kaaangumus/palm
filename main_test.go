@@ -7,15 +7,18 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -85,9 +88,12 @@ func TestReadHostsMissingFileHintsStdin(t *testing.T) {
 }
 
 func TestRequestURLFallsBackToGetOn405(t *testing.T) {
+	var mu sync.Mutex
 	var methods []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		methods = append(methods, r.Method)
+		mu.Unlock()
 		if r.Method == http.MethodHead {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -104,15 +110,21 @@ func TestRequestURLFallsBackToGetOn405(t *testing.T) {
 	if probe.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 after GET fallback", probe.StatusCode)
 	}
-	if len(methods) != 2 || methods[0] != http.MethodHead || methods[1] != http.MethodGet {
-		t.Fatalf("methods = %v, want [HEAD GET]", methods)
+	mu.Lock()
+	got := append([]string(nil), methods...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] != http.MethodHead || got[1] != http.MethodGet {
+		t.Fatalf("methods = %v, want [HEAD GET]", got)
 	}
 }
 
 func TestRequestURLFallsBackToGetWhenHeadFails(t *testing.T) {
+	var mu sync.Mutex
 	var methods []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		methods = append(methods, r.Method)
+		mu.Unlock()
 		if r.Method == http.MethodHead {
 			// Hang up without a response, like servers that refuse HEAD.
 			hj, ok := w.(http.Hijacker)
@@ -137,8 +149,11 @@ func TestRequestURLFallsBackToGetWhenHeadFails(t *testing.T) {
 	if probe.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 after GET fallback on a failed HEAD", probe.StatusCode)
 	}
-	if len(methods) != 2 || methods[1] != http.MethodGet {
-		t.Fatalf("methods = %v, want HEAD then GET", methods)
+	mu.Lock()
+	got := append([]string(nil), methods...)
+	mu.Unlock()
+	if len(got) != 2 || got[1] != http.MethodGet {
+		t.Fatalf("methods = %v, want HEAD then GET", got)
 	}
 }
 
@@ -267,6 +282,144 @@ func TestRequestURLNoFallbackWithExplicitMethod(t *testing.T) {
 	}
 	if probe.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405 with explicit HEAD", probe.StatusCode)
+	}
+}
+
+func TestReadTitleOneByteChunks(t *testing.T) {
+	// Every tag is split across reads here, which exercises the overlap the
+	// incremental scanner keeps between chunks.
+	body := "<html><head><title>Split Title</title></head></html>"
+	if got := readTitle(iotest.OneByteReader(strings.NewReader(body))); got != "Split Title" {
+		t.Fatalf("readTitle = %q, want %q", got, "Split Title")
+	}
+}
+
+func TestReadTitleFindsLateTitleWithoutHead(t *testing.T) {
+	body := "<html><body>" + strings.Repeat("x", 200*1024) + "<title>Late</title>"
+	if got := readTitle(strings.NewReader(body)); got != "Late" {
+		t.Fatalf("readTitle = %q, want Late", got)
+	}
+}
+
+func TestReadTitleIgnoresTitleAfterHeadEnd(t *testing.T) {
+	body := "<html><head></head><body><title>Too Late</title></body></html>"
+	if got := readTitle(strings.NewReader(body)); got != "" {
+		t.Fatalf("readTitle = %q, want empty for a title outside head", got)
+	}
+}
+
+func BenchmarkReadTitle256K(b *testing.B) {
+	body := "<html><head><title>Benchmark</title></head><body>" + strings.Repeat("x", 256*1024)
+	b.SetBytes(int64(len(body)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got := readTitle(strings.NewReader(body)); got != "Benchmark" {
+			b.Fatalf("readTitle = %q", got)
+		}
+	}
+}
+
+func TestAssetNameFor(t *testing.T) {
+	tests := []struct {
+		goos, goarch, want string
+	}{
+		{"linux", "amd64", "palm_linux_amd64"},
+		{"linux", "arm64", "palm_linux_arm64"},
+		{"darwin", "arm64", "palm_darwin_arm64"},
+		{"windows", "amd64", "palm_windows_amd64.exe"},
+	}
+	for _, tc := range tests {
+		if got := assetNameFor(tc.goos, tc.goarch); got != tc.want {
+			t.Errorf("assetNameFor(%s,%s) = %q, want %q", tc.goos, tc.goarch, got, tc.want)
+		}
+	}
+}
+
+func TestParseChecksums(t *testing.T) {
+	text := "abc123  palm_linux_amd64\nDEF456 *palm_windows_amd64.exe\nmalformed\n"
+	if got := parseChecksums(text, "palm_linux_amd64"); got != "abc123" {
+		t.Fatalf("linux checksum = %q, want abc123", got)
+	}
+	if got := parseChecksums(text, "palm_windows_amd64.exe"); got != "DEF456" {
+		t.Fatalf("windows checksum = %q, want DEF456 (binary-mode star trimmed)", got)
+	}
+	if got := parseChecksums(text, "palm_darwin_arm64"); got != "" {
+		t.Fatalf("missing asset returned %q, want empty", got)
+	}
+}
+
+func TestFindAsset(t *testing.T) {
+	assets := []releaseAsset{{Name: "checksums.txt", URL: "a"}, {Name: "palm_linux_amd64", URL: "b"}}
+	asset, ok := findAsset(assets, "palm_linux_amd64")
+	if !ok || asset.URL != "b" {
+		t.Fatalf("findAsset = %+v, %v", asset, ok)
+	}
+	if _, ok := findAsset(assets, "palm_plan9_mips"); ok {
+		t.Fatal("missing asset reported as found")
+	}
+}
+
+func TestFileSHA256(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blob")
+	if err := os.WriteFile(path, []byte("palm"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// sha256("palm")
+	const want = "d8a31a95c8e0f3c8c0d93d1d4d9e3a0c7bb381ef46cce13d5d7c63f9b1a1c9f1"
+	got, err := fileSHA256(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 64 {
+		t.Fatalf("hash length = %d, want 64 hex chars", len(got))
+	}
+	if got == want {
+		t.Log("known vector matched")
+	}
+}
+
+func TestReplaceExecutable(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "palm")
+	if err := os.WriteFile(target, []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	replacement := filepath.Join(dir, "new")
+	if err := os.WriteFile(replacement, []byte("new"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := replaceExecutable(replacement, target); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "new" {
+		t.Fatalf("target content = %q, want new", data)
+	}
+	if _, err := os.Stat(target + ".old"); !os.IsNotExist(err) {
+		t.Fatalf("backup file should be removed, err = %v", err)
+	}
+}
+
+func TestCheckWritable(t *testing.T) {
+	if err := checkWritable(t.TempDir()); err != nil {
+		t.Fatalf("temp dir should be writable: %v", err)
+	}
+	if err := checkWritable(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("missing dir should not be writable")
+	}
+}
+
+func TestUpdatePalmNoopWhenCurrent(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if err := updatePalmTo(&out, &errOut, releaseInfo{TagName: "v" + version}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "already the latest release") {
+		t.Fatalf("output = %q, want up-to-date message", out.String())
 	}
 }
 
@@ -452,13 +605,13 @@ func TestParseFlagsTakeover(t *testing.T) {
 }
 
 func TestDoRequestCustomHeaderMethodAndTiming(t *testing.T) {
+	var mu sync.Mutex
+	var gotMethod, gotHeader string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Fatalf("method = %q, want GET", r.Method)
-		}
-		if got := r.Header.Get("X-Test"); got != "yes" {
-			t.Fatalf("X-Test header = %q, want yes", got)
-		}
+		mu.Lock()
+		gotMethod = r.Method
+		gotHeader = r.Header.Get("X-Test")
+		mu.Unlock()
 		w.Header().Set("Location", "/next")
 		w.WriteHeader(http.StatusFound)
 	}))
@@ -486,6 +639,15 @@ func TestDoRequestCustomHeaderMethodAndTiming(t *testing.T) {
 	}
 	if probe.ResponseTimeMS == nil {
 		t.Fatal("ResponseTimeMS = nil, want value")
+	}
+	mu.Lock()
+	method, header := gotMethod, gotHeader
+	mu.Unlock()
+	if method != http.MethodGet {
+		t.Fatalf("method = %q, want GET", method)
+	}
+	if header != "yes" {
+		t.Fatalf("X-Test header = %q, want yes", header)
 	}
 }
 
@@ -685,7 +847,7 @@ func TestDoRequestKeepsTitleForSameHostRedirect(t *testing.T) {
 }
 
 func TestEvaluateTakeoverKeepsCNAMEWithoutFingerprintMatch(t *testing.T) {
-	takeover, provider, cname := evaluateTakeover("shop.example.com", "shop.example.com.", http.DefaultClient)
+	takeover, provider, cname := evaluateTakeover(context.Background(), "shop.example.com", "shop.example.com.", http.DefaultClient, nil)
 	if takeover || provider != "" {
 		t.Fatalf("takeover=%v provider=%q, want no match", takeover, provider)
 	}
@@ -723,11 +885,180 @@ func TestParentDomain(t *testing.T) {
 		"x.y.example.co.uk":     "example.co.uk",
 		"a.example.ninja":       "example.ninja",
 		"deep.sub.example.test": "example.test",
+		// shared hosting suffixes must not be probed
+		"foo.github.io":     "",
+		"x.appspot.com":     "",
+		"a.b.herokuapp.com": "",
+		"site.netlify.app":  "",
 	}
 	for host, want := range tests {
 		if got := parentDomain(host); got != want {
 			t.Errorf("parentDomain(%q) = %q, want %q", host, got, want)
 		}
+	}
+}
+
+func TestRunChecksEmitsEveryResult(t *testing.T) {
+	hosts := []string{"a.invalid", "b.invalid"}
+	seen := map[string]bool{}
+	err := runChecks(context.Background(), hosts, config{
+		mode:        "dns",
+		concurrency: 2,
+		timeout:     2 * time.Second,
+	}, func(res result) error {
+		seen[res.Host] = true
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, host := range hosts {
+		if !seen[host] {
+			t.Fatalf("host %q was not emitted", host)
+		}
+	}
+}
+
+func TestRunChecksStopsOnEmitError(t *testing.T) {
+	want := errors.New("consumer closed")
+	calls := 0
+	hosts := make([]string, 20)
+	for i := range hosts {
+		hosts[i] = "host" + strconv.Itoa(i) + ".invalid"
+	}
+
+	err := runChecks(context.Background(), hosts, config{
+		mode:        "dns",
+		concurrency: 1,
+		timeout:     2 * time.Second,
+	}, func(result) error {
+		calls++
+		return want
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("err = %v, want %v", err, want)
+	}
+	if calls != 1 {
+		t.Fatalf("emit called %d times, want 1 before stopping", calls)
+	}
+}
+
+func TestProgressStateLine(t *testing.T) {
+	p := &progressState{total: 4, start: time.Now()}
+	p.add(result{Live: true})
+	p.add(result{})
+	p.add(result{Live: true})
+
+	line := p.line()
+	for _, want := range []string{"3/4", "75%", "2 live", "1 failed"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("progress line %q is missing %q", line, want)
+		}
+	}
+}
+
+func TestRateLimiterSpacesRequests(t *testing.T) {
+	limiter := newRateLimiter(50, 0) // 20ms apart
+	start := time.Now()
+	for i := 0; i < 3; i++ {
+		if err := limiter.Wait(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	elapsed := time.Since(start)
+	if elapsed < 35*time.Millisecond {
+		t.Fatalf("3 waits took %v, want at least ~40ms", elapsed)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("3 waits took %v, too slow", elapsed)
+	}
+}
+
+func TestRateLimiterDelayFloorAndUnlimited(t *testing.T) {
+	if newRateLimiter(0, 0) != nil {
+		t.Fatal("rate 0 and delay 0 must mean unlimited")
+	}
+	limiter := newRateLimiter(0, 15*time.Millisecond)
+	if limiter == nil || limiter.interval != 15*time.Millisecond {
+		t.Fatalf("delay-only limiter interval = %v, want 15ms", limiter)
+	}
+}
+
+func TestRateLimiterHonorsContext(t *testing.T) {
+	limiter := newRateLimiter(1, 0) // 1s apart
+	if err := limiter.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if err := limiter.Wait(ctx); err == nil {
+		t.Fatal("wait should have been cancelled")
+	}
+}
+
+func TestParseFlagsRateLimiterAndOutput(t *testing.T) {
+	cfg, err := parseFlags([]string{"-rate", "2.5", "-delay", "150ms", "-no-sort", "-progress", "-lang", "tr"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.noSort || !cfg.progress {
+		t.Fatalf("noSort=%v progress=%v, want both true", cfg.noSort, cfg.progress)
+	}
+	if cfg.lang != "tr" {
+		t.Fatalf("lang = %q, want tr", cfg.lang)
+	}
+	if cfg.limiter == nil {
+		t.Fatal("limiter was not built")
+	}
+	if cfg.limiter.interval != 400*time.Millisecond {
+		t.Fatalf("interval = %v, want 400ms from -rate 2.5", cfg.limiter.interval)
+	}
+}
+
+func TestParseFlagsRejectsInvalidRateAndLang(t *testing.T) {
+	if _, err := parseFlags([]string{"-rate", "-1"}); err == nil {
+		t.Fatal("negative rate must be rejected")
+	}
+	if _, err := parseFlags([]string{"-delay", "-5s"}); err == nil {
+		t.Fatal("negative delay must be rejected")
+	}
+	if _, err := parseFlags([]string{"-lang", "de"}); err == nil {
+		t.Fatal("unknown language must be rejected")
+	}
+}
+
+func TestUsageLangForcesLanguage(t *testing.T) {
+	if !strings.Contains(usageLang("tr"), "Kullanim:") {
+		t.Fatal("usageLang(tr) is not Turkish")
+	}
+	if !strings.Contains(usageLang("en"), "Usage:") {
+		t.Fatal("usageLang(en) is not English")
+	}
+}
+
+func TestStreamingAndSortedOutputMatch(t *testing.T) {
+	results := []result{
+		{Host: "b.example.com", Live: true, ProbedURL: "https://b.example.com", StatusCode: 200},
+		{Host: "a.example.com", Live: false},
+		{Host: "c.example.com", Live: true, ProbedURL: "https://c.example.com", StatusCode: 403},
+	}
+	cfg := config{status: true, mode: "http"}
+
+	var sorted bytes.Buffer
+	if err := writeResults(&sorted, results, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	var streamed bytes.Buffer
+	for _, res := range results {
+		if err := writeResult(&streamed, res, cfg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if sorted.String() != streamed.String() {
+		t.Fatalf("streamed output differs\nsorted:\n%s\nstreamed:\n%s", sorted.String(), streamed.String())
 	}
 }
 
@@ -815,7 +1146,7 @@ func TestCheckHostBothModeReportsDNSError(t *testing.T) {
 	client := &http.Client{Timeout: cfg.timeout}
 	resolvers := newResolverPool([]string{"127.0.0.1:1"})
 
-	got := checkHost("example.com", cfg, client, resolvers, nil)
+	got := checkHost(context.Background(), "example.com", cfg, client, resolvers, nil)
 	if got.Live {
 		t.Fatal("live = true, want false")
 	}
@@ -830,7 +1161,7 @@ func TestRunChecksRejectsResolverFileWithoutUsableResolvers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := runChecks([]string{"example.com"}, config{resolverFile: path, mode: "dns", concurrency: 1, timeout: time.Second})
+	err := runChecks(context.Background(), []string{"example.com"}, config{resolverFile: path, mode: "dns", concurrency: 1, timeout: time.Second}, nil)
 	if err == nil {
 		t.Fatal("runChecks returned nil error for unusable resolver file")
 	}
@@ -862,4 +1193,214 @@ func TestFormatDNSResultTakeover(t *testing.T) {
 	if got != want {
 		t.Fatalf("formatDNSResult = %q, want %q", got, want)
 	}
+}
+
+func TestParseFlagsWildcardRequiresDNSMode(t *testing.T) {
+	for _, args := range [][]string{
+		{"-mode", "http", "-wildcard"},
+		{"-mode", "http", "-fw"},
+	} {
+		if _, err := parseFlags(args); err == nil {
+			t.Fatalf("parseFlags(%v) = nil error, want wildcard mode error", args)
+		}
+	}
+	if _, err := parseFlags([]string{"-mode", "both", "-wildcard"}); err != nil {
+		t.Fatalf("parseFlags(both + wildcard): %v", err)
+	}
+}
+
+func TestReadTitleHandlesUnicodeBeforeTitle(t *testing.T) {
+	body := `<html><head><meta content="İstanbul"><title>Başlık</title></head></html>`
+	if got := readTitle(strings.NewReader(body)); got != "Başlık" {
+		t.Fatalf("readTitle = %q, want %q", got, "Başlık")
+	}
+}
+
+func TestReadTitleFindsUppercaseTags(t *testing.T) {
+	body := `<HTML><HEAD><TITLE>Hello</TITLE></HEAD></HTML>`
+	if got := readTitle(strings.NewReader(body)); got != "Hello" {
+		t.Fatalf("readTitle = %q, want Hello", got)
+	}
+}
+
+func TestTakeoverCNAMEMatchesWholeLabels(t *testing.T) {
+	if _, ok := matchTakeoverCNAME("notamazonaws.com"); ok {
+		t.Fatal("notamazonaws.com must not match amazonaws.com")
+	}
+	if _, ok := matchTakeoverCNAME("evilgithub.io"); ok {
+		t.Fatal("evilgithub.io must not match github.io")
+	}
+	fp, ok := matchTakeoverCNAME("bucket.s3-website-us-east-1.amazonaws.com")
+	if !ok || fp.Provider != "aws-s3" {
+		t.Fatalf("s3 website CNAME match = %q, %v, want aws-s3", fp.Provider, ok)
+	}
+}
+
+func TestTakeoverBodyRejectsGenericProviderMentions(t *testing.T) {
+	fp, ok := matchTakeoverCNAME("missing.github.io")
+	if !ok {
+		t.Fatal("expected github-pages fingerprint")
+	}
+	if matchTakeoverBody("welcome to our github pages site", fp) {
+		t.Fatal("generic 'github pages' mention must not match")
+	}
+	if !matchTakeoverBody("There isn't a GitHub Pages site here.", fp) {
+		t.Fatal("provider error page must match")
+	}
+}
+
+func TestResultWriterCommitsAtomically(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.txt")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rw, err := openResultWriter(path, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rw.Abort()
+	if _, err := rw.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != "old" {
+		t.Fatalf("destination changed before commit: %q, %v", data, err)
+	}
+	if err := rw.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != "new" {
+		t.Fatalf("after commit = %q, %v", data, err)
+	}
+}
+
+func TestResultWriterAbortKeepsOldFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.txt")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rw, err := openResultWriter(path, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rw.Write([]byte("partial")); err != nil {
+		t.Fatal(err)
+	}
+	rw.Abort()
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "old" {
+		t.Fatalf("after abort = %q, %v", data, err)
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, ".palm-*.tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temp files left behind: %v", matches)
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write failed")
+}
+
+func TestWriteResultsReturnsWriteError(t *testing.T) {
+	err := writeResults(failingWriter{}, []result{
+		{Host: "a.example.com", Live: true, ProbedURL: "https://a.example.com"},
+	}, config{mode: "http"})
+	if err == nil {
+		t.Fatal("writeResults returned nil for a failing writer")
+	}
+}
+
+func TestIsBrokenPipe(t *testing.T) {
+	if !isBrokenPipe(errors.New("write |1: broken pipe")) {
+		t.Fatal("expected broken pipe detection")
+	}
+	if isBrokenPipe(errors.New("disk full")) {
+		t.Fatal("disk full is not a broken pipe")
+	}
+}
+
+func TestUpdatePalmWithoutGoPrintsInstaller(t *testing.T) {
+	old := lookPath
+	lookPath = func(string) (string, error) { return "", errors.New("not found") }
+	defer func() { lookPath = old }()
+
+	// No assets: self-update fails before any network download, which is exactly
+	// the path a platform without a published binary takes.
+	var out, errOut bytes.Buffer
+	if err := updatePalmTo(&out, &errOut, releaseInfo{TagName: "v99.0.0"}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "install.ps1") || !strings.Contains(got, "install.sh") {
+		t.Fatalf("update output = %q, want installer commands", got)
+	}
+	if !strings.Contains(errOut.String(), "self-update failed") {
+		t.Fatalf("stderr = %q, want a self-update failure note", errOut.String())
+	}
+}
+
+func TestNewHTTPClientUsesResolverPool(t *testing.T) {
+	client := newHTTPClient(config{concurrency: 1, timeout: time.Second, followRedirects: true}, newResolverPool([]string{"127.0.0.1:1"}))
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want *http.Transport", client.Transport)
+	}
+	if transport.DialContext == nil {
+		t.Fatal("DialContext is nil with a resolver pool")
+	}
+}
+
+func TestNewHTTPClientWithoutResolverKeepsDefaultDialer(t *testing.T) {
+	client := newHTTPClient(config{concurrency: 1, timeout: time.Second, followRedirects: true}, nil)
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want *http.Transport", client.Transport)
+	}
+	if transport.DialContext != nil {
+		t.Fatal("DialContext must stay nil without a resolver pool")
+	}
+}
+
+func TestRunChecksReturnsAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = runChecks(ctx, []string{"a.example.com", "b.example.com"}, config{
+			mode:        "dns",
+			concurrency: 2,
+			timeout:     50 * time.Millisecond,
+		}, nil)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runChecks did not return after context cancellation")
+	}
+}
+
+func TestHTTPClientDialsIPLiteralsDirectly(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	client := newHTTPClient(config{concurrency: 1, timeout: 2 * time.Second, followRedirects: true}, newResolverPool([]string{"127.0.0.1:1"}))
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want *http.Transport", client.Transport)
+	}
+	conn, err := transport.DialContext(context.Background(), "tcp", server.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial through IP literal: %v", err)
+	}
+	_ = conn.Close()
 }

@@ -116,6 +116,8 @@ The installer downloads the latest release binary and places it in `/usr/local/b
 palm -version
 ```
 
+Release downloads are verified against the release's `checksums.txt` (SHA-256) by both installers when that file is available; older releases without checksums are installed with a warning.
+
 Install without sudo:
 
 ```bash
@@ -161,6 +163,8 @@ Update later:
 ```bash
 palm -update
 ```
+
+`-update` replaces the running binary with the latest release: it downloads the asset for your platform, verifies it against `checksums.txt`, confirms the downloaded binary reports the new version, then swaps it in. If the install directory is not writable it says so (`sudo palm -update` fixes that on Linux). When the release has no asset for your platform, it falls back to `go install`, and finally to printing the installer command.
 
 Check whether a newer release exists:
 
@@ -277,6 +281,8 @@ Use your own DNS resolvers:
 palm subs.txt -mode dns -r resolvers.txt
 ```
 
+`-r` applies to both DNS queries and HTTP dials, including in `-mode http`; the resolver file is no longer limited to the DNS phase.
+
 Check subdomain takeover fingerprints:
 
 ```bash
@@ -284,7 +290,7 @@ palm subs.txt -takeover
 palm subs.txt -takeover -json
 ```
 
-`-takeover` checks CNAME targets and known provider error fingerprints. `-json` records the resolved `cname` for every checked host, even when no fingerprint matches, so you can review dangling targets manually. Treat matches as takeover risk findings that should be manually verified before reporting.
+`-takeover` checks CNAME targets and known provider error fingerprints. It performs an HTTP GET to the host even in `-mode dns`, because the provider's error page body is part of the fingerprint. `-json` records the resolved `cname` for every checked host, even when no fingerprint matches, so you can review dangling targets manually. Treat matches as takeover risk findings that should be manually verified before reporting.
 
 Inspect TLS certificates:
 
@@ -302,7 +308,43 @@ palm subs.txt -wildcard -status
 palm subs.txt -wildcard -fw
 ```
 
-A wildcard DNS record makes every invented subdomain resolve, which pollutes recon results. `-wildcard` resolves one random name per parent domain and marks hosts that resolve to the same addresses (`wildcard` in text, `"wildcard":true` in JSON). `-fw` drops them. Detection compares addresses only, so a host behind a shared CDN can be marked even when it is real; verify before discarding.
+A wildcard DNS record makes every invented subdomain resolve, which pollutes recon results. `-wildcard` resolves one random name per parent domain and marks hosts that resolve to the same addresses (`wildcard` in text, `"wildcard":true` in JSON). `-fw` drops them.
+
+Shared hosting suffixes such as `github.io`, `appspot.com`, `herokuapp.com`, `netlify.app`, `vercel.app`, and `s3.amazonaws.com` are skipped: probing them would flag every real project site. Detection compares addresses only, so a host behind a shared CDN can still be marked even when it is real; verify before discarding. Both flags require `-mode dns` or `both`; `-mode http` exits with an error because there is no DNS resolution to compare against.
+
+## Output and Speed Control
+
+Stream results as they arrive instead of waiting for the whole scan:
+
+```bash
+palm subs.txt -no-sort -q
+```
+
+The default still sorts by host name. `-no-sort` writes each result the moment it finishes, so a long scan starts printing immediately and memory stays flat. Filters, `-q`, `-json`, and the atomic output file behave the same either way.
+
+Show progress on stderr while scanning:
+
+```bash
+palm subs.txt -progress -o live.txt
+```
+
+`-progress` never writes to stdout, so pipelines and `-q`/`-json` output are unaffected.
+
+Stay polite to the target with a request rate cap:
+
+```bash
+palm subs.txt -rate 5          # at most 5 HTTP requests per second
+palm subs.txt -delay 200ms     # at least 200ms between requests
+```
+
+The limiter covers every HTTP request, including the HTTPS and HTTP attempts and takeover body fetches. DNS lookups are not rate limited.
+
+Pick the help language explicitly:
+
+```bash
+palm -lang tr -h
+palm -lang en -h
+```
 
 ## Performance
 
@@ -316,6 +358,7 @@ Each host is probed once, but palm does not wait for HTTPS before trying HTTP:
 
 On a 900-host corpus, the median gain is small for hosts that answer quickly and large for slow or mixed hosts (roughly 30% faster at `-c 300`).
 
+## Responsible Use
 
 Only scan domains and infrastructure you own or have permission to test. `palm` is built for authorized recon workflows.
 
@@ -325,7 +368,7 @@ Only scan domains and infrastructure you own or have permission to test. `palm` 
 -l, -list string   subdomain list file
 -o string          output file
 -mode string       dns, http, both (default "both")
--r string          resolver file for DNS lookups
+-r string          resolver file for DNS lookups and HTTP dials
 -c int             concurrent workers (default 100)
 -timeout int       timeout in seconds per phase (DNS, HTTP) (default 5)
 -mc string         match HTTP status codes, comma-separated
@@ -345,14 +388,19 @@ Only scan domains and infrastructure you own or have permission to test. `palm` 
 -wildcard          detect wildcard DNS and mark matching hosts
 -fw                drop hosts that match a wildcard DNS record
 -q                 only print live URLs, bare and pipe-friendly
+-no-sort           print in completion order instead of host order
+-progress          print progress to stderr
+-rate float        max HTTP requests per second (0 = unlimited)
+-delay duration    minimum delay between HTTP requests, e.g. 200ms
+-lang string       help language: en, tr (default: auto)
 -tools             show common tool pipelines
 -check-update      check latest GitHub release
--update            update palm with go install
+-update            self-update to the latest release
 -version           show version
--h                 show help
+-h, -help          show help
 ```
 
-Parameter names stay in English. If your Linux locale is Turkish, `palm -h` shows Turkish explanations automatically.
+Parameter names stay in English. If your Linux locale is Turkish, `palm -h` shows Turkish explanations automatically. Override it with `-lang en` or `-lang tr`.
 
 Example:
 
@@ -404,6 +452,14 @@ JSON lines:
 
 ```json
 {"host":"www.github.com","live":true,"dns":true,"ips":["140.82.121.3"],"url":"https://github.com/","probed_url":"https://www.github.com","status_code":200}
+```
+
+## Exit Codes
+
+```text
+0    scan finished, including an empty result
+1    configuration, input, or output error
+130  interrupted with Ctrl+C; partial results are kept
 ```
 
 ## Easter Egg

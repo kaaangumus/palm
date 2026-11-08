@@ -9,8 +9,31 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    name: Test release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Format check
+        run: test -z "$(gofmt -l .)"
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Vet
+        run: go vet ./...
+
   build:
     name: Build release artifacts
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -49,7 +72,8 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
-        run: go build -trimpath -ldflags="-s -w" -o "dist/${{ matrix.artifact }}" .
+          VERSION: ${{ github.ref_name }}
+        run: go build -trimpath -ldflags="-s -w -X main.version=${VERSION#v}" -o "dist/${{ matrix.artifact }}" .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -67,6 +91,21 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      - name: Verify version matches tag
+        run: |
+          chmod +x dist/palm_linux_amd64
+          got="$(dist/palm_linux_amd64 -version)"
+          want="palm ${GITHUB_REF_NAME#v}"
+          if [ "$got" != "$want" ]; then
+            echo "version mismatch: got '$got', want '$want'" >&2
+            exit 1
+          fi
+
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum palm_* > checksums.txt
 
       - name: Create release
         uses: softprops/action-gh-release@v3

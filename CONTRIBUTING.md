@@ -7,7 +7,7 @@ Thanks for helping improve `palm`.
 ```bash
 git clone https://github.com/kaaangumus/palm.git
 cd palm
-go test ./...
+go test -race ./...
 go vet ./...
 go build -o palm .
 ```
@@ -17,7 +17,7 @@ go build -o palm .
 - Keep changes focused.
 - Add or update tests for behavior changes.
 - Update README examples when flags or output change.
-- Run `gofmt`, `go test ./...`, and `go vet ./...` before opening a PR.
+- Run `gofmt`, `go test -race ./...`, and `go vet ./...` before opening a PR.
 
 ## Fingerprints
 

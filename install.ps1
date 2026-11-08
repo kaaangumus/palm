@@ -36,6 +36,11 @@ $binName = 'palm.exe'
 
 $InstallDir = if ($env:PALM_INSTALL_DIR) { $env:PALM_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\palm' }
 $Version    = if ($env:PALM_VERSION) { $env:PALM_VERSION } else { 'latest' }
+$tagName    = if ($Version -ne 'latest') {
+    if ($Version.StartsWith('v')) { $Version } else { "v$Version" }
+} else {
+    'latest'
+}
 
 function Write-Step([string]$Message) { Write-Host "==> $Message" -ForegroundColor Cyan }
 function Write-Ok([string]$Message) { Write-Host "  ok  $Message" -ForegroundColor Green }
@@ -79,7 +84,7 @@ function Get-DownloadUrl([string]$arch) {
 function Save-Binary([string]$url, [string]$destination) {
     try {
         if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
-            & curl.exe -fsSL $url -o $destination
+            & curl.exe -fsSL --retry 3 --retry-delay 2 $url -o $destination
             if ($LASTEXITCODE -ne 0) {
                 if ($LASTEXITCODE -eq 22) { throw "dosya bulunamadi (HTTP hata): $url" }
                 throw "indirme basarisiz (curl exit $LASTEXITCODE)"
@@ -101,6 +106,55 @@ function Save-Binary([string]$url, [string]$destination) {
         if ($status) { throw "indirme basarisiz (HTTP $status): $url" }
         throw "indirme basarisiz: $($_.Exception.Message)"
     }
+}
+
+# GitHub'in release CDN'i bazi aglarda 504 dondururken API ayni dosyayi
+# sunabiliyor. Bu yol asset'i API uzerinden indirir.
+function Save-BinaryViaApi([string]$assetName, [string]$destination) {
+    $releaseUrl = if ($Version -and $Version -ne 'latest') {
+        "https://api.github.com/repos/$repo/releases/tags/$tagName"
+    } else {
+        "https://api.github.com/repos/$repo/releases/latest"
+    }
+
+    Write-Step "GitHub API uzerinden cozuluyor: $assetName"
+    try {
+        $headers = @{ 'User-Agent' = 'palm-installer'; 'Accept' = 'application/vnd.github+json' }
+        $release = Invoke-RestMethod -Uri $releaseUrl -Headers $headers -UseBasicParsing
+    } catch {
+        throw "surum bilgisi alinamadi: $($_.Exception.Message)"
+    }
+
+    $asset = @($release.assets) | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+    if (-not $asset) { throw "yayinda '$assetName' adli dosya yok" }
+
+    # binary icerigi icin octet-stream iste
+    $assetHeaders = @{ 'User-Agent' = 'palm-installer'; 'Accept' = 'application/octet-stream' }
+    $assetUrl = "https://api.github.com/repos/$repo/releases/assets/$($asset.id)"
+    if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+        & curl.exe -fsSL --retry 3 --retry-delay 2 -H 'Accept: application/octet-stream' -H 'User-Agent: palm-installer' $assetUrl -o $destination
+        if ($LASTEXITCODE -ne 0) { throw "API indirmesi basarisiz (curl exit $LASTEXITCODE)" }
+    } else {
+        Invoke-WebRequest -Uri $assetUrl -Headers $assetHeaders -OutFile $destination -UseBasicParsing
+    }
+}
+
+function Save-BinaryViaGh([string]$assetName, [string]$destination) {
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { return $false }
+    Write-Step "gh CLI uzerinden cozuluyor: $assetName"
+    & gh release download $tagName --repo $repo --pattern $assetName --output $destination --clobber 2>&1 | Out-Host
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Get-ExpectedChecksum([string]$asset, [string]$checksumsPath) {
+    if (-not (Test-Path -LiteralPath $checksumsPath)) { return $null }
+    foreach ($line in Get-Content -LiteralPath $checksumsPath) {
+        $parts = $line -split '\s+'
+        if ($parts.Count -ge 2 -and $parts[1] -eq $asset) {
+            return $parts[0].ToLowerInvariant()
+        }
+    }
+    return $null
 }
 
 function Assert-IsBinary([string]$path) {
@@ -152,22 +206,87 @@ try {
 
     $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("palm-" + [Guid]::NewGuid().ToString('N') + '.exe')
     try {
+        $downloaded = $false
+        $assetName = $target.Asset
+
+        # 1) dogrudan release URL'i
         try {
             Save-Binary -url $target.Url -destination $tmp
+            $downloaded = $true
         } catch {
-            # arm64 icin yayinlanmis ikili yoksa x64 surumune dus (Windows ARM64 x64 emule eder)
-            if ($arch -eq 'arm64') {
-                Write-Warn 'arm64 surumu bulunamadi, x64 surumu denenecek.'
-                $arch = 'amd64'
-                $target = Get-DownloadUrl -arch $arch
-                Write-Step "indiriliyor: $($target.Asset)"
-                Save-Binary -url $target.Url -destination $tmp
-            } else {
-                throw
+            Write-Warn "dogrudan indirme basarisiz: $($_.Exception.Message)"
+        }
+
+        # 2) gh CLI (oturum acmis ise kimlikli API istegi kullanir)
+        if (-not $downloaded) {
+            if (Save-BinaryViaGh -assetName $assetName -destination $tmp) { $downloaded = $true }
+        }
+
+        # 3) GitHub API asset endpoint'i
+        if (-not $downloaded) {
+            try {
+                Save-BinaryViaApi -assetName $assetName -destination $tmp
+                $downloaded = $true
+            } catch {
+                Write-Warn "API indirmesi basarisiz: $($_.Exception.Message)"
             }
         }
 
+        # arm64 yayini yoksa x64 surumune dus (Windows ARM64 x64 emule eder)
+        if (-not $downloaded -and $arch -eq 'arm64') {
+            Write-Warn 'arm64 surumu bulunamadi, x64 surumu denenecek.'
+            $arch = 'amd64'
+            $target = Get-DownloadUrl -arch $arch
+            $assetName = $target.Asset
+            Write-Step "indiriliyor: $assetName"
+            try {
+                Save-Binary -url $target.Url -destination $tmp
+                $downloaded = $true
+            } catch {
+                Write-Warn "dogrudan indirme basarisiz: $($_.Exception.Message)"
+            }
+            if (-not $downloaded) {
+                if (Save-BinaryViaGh -assetName $assetName -destination $tmp) { $downloaded = $true }
+            }
+            if (-not $downloaded) {
+                try {
+                    Save-BinaryViaApi -assetName $assetName -destination $tmp
+                    $downloaded = $true
+                } catch {
+                    Write-Warn "API indirmesi basarisiz: $($_.Exception.Message)"
+                }
+            }
+        }
+
+        if (-not $downloaded) {
+            throw "indirme basarisiz. Biraz sonra tekrar deneyin veya Go ile kurun: go install github.com/$repo@latest"
+        }
+
         Assert-IsBinary -path $tmp
+
+        $checksumsUrl = $target.Url -replace '/[^/]+$', '/checksums.txt'
+        $checksumsPath = Join-Path ([System.IO.Path]::GetTempPath()) ("palm-sha256-" + [Guid]::NewGuid().ToString('N') + '.txt')
+        $checksumsFetched = $false
+        $expected = $null
+        try {
+            Save-Binary -url $checksumsUrl -destination $checksumsPath
+            $checksumsFetched = $true
+            $expected = Get-ExpectedChecksum -asset $assetName -checksumsPath $checksumsPath
+        } catch {
+            Write-Warn 'checksum dosyasi alinamadi; dogrulama atlaniyor.'
+        } finally {
+            if (Test-Path -LiteralPath $checksumsPath) { Remove-Item -LiteralPath $checksumsPath -Force -ErrorAction SilentlyContinue }
+        }
+
+        if ($expected) {
+            $actual = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $expected) {
+                throw "sha256 dogrulanamadi: $assetName"
+            }
+            Write-Ok 'sha256 dogrulandi'
+        } elseif ($checksumsFetched) {
+            Write-Warn "checksum bulunamadi: $assetName"
+        }
 
         if (-not (Test-Path -LiteralPath $InstallDir)) {
             New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null

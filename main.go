@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -18,6 +20,9 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,7 +31,8 @@ import (
 	"time"
 )
 
-const version = "0.5.0"
+var version = "0.6.0"
+
 const modulePath = "github.com/kaaangumus/palm"
 const latestReleaseURL = "https://api.github.com/repos/kaaangumus/palm/releases/latest"
 
@@ -52,6 +58,13 @@ type config struct {
 	tlsInfo         bool
 	wildcard        bool
 	filterWildcard  bool
+	lang            string
+	rate            float64
+	delay           time.Duration
+	limiter         *rateLimiter
+	noSort          bool
+	progress        bool
+	progressOut     io.Writer
 	matchCodes      map[int]struct{}
 	filterCodes     map[int]struct{}
 }
@@ -96,8 +109,14 @@ type httpProbe struct {
 }
 
 type releaseInfo struct {
-	TagName string `json:"tag_name"`
-	URL     string `json:"html_url"`
+	TagName string         `json:"tag_name"`
+	URL     string         `json:"html_url"`
+	Assets  []releaseAsset `json:"assets"`
+}
+
+type releaseAsset struct {
+	Name string `json:"name"`
+	URL  string `json:"browser_download_url"`
 }
 
 type headerFlags []string
@@ -115,6 +134,57 @@ type resolverPool struct {
 	addrs     []string
 	resolvers []*net.Resolver
 	next      uint64
+}
+
+// rateLimiter spaces HTTP requests so a scan stays polite. A nil limiter means
+// no limit. The zero value is not usable; build it with newRateLimiter.
+type rateLimiter struct {
+	mu       sync.Mutex
+	interval time.Duration
+	next     time.Time
+}
+
+// newRateLimiter builds a limiter from -rate (requests per second) and -delay
+// (minimum gap). A non-positive rate and delay means unlimited.
+func newRateLimiter(rate float64, delay time.Duration) *rateLimiter {
+	interval := time.Duration(0)
+	if rate > 0 {
+		interval = time.Duration(float64(time.Second) / rate)
+	}
+	if delay > interval {
+		interval = delay
+	}
+	if interval <= 0 {
+		return nil
+	}
+	return &rateLimiter{interval: interval}
+}
+
+// Wait blocks until the next request slot is due, or ctx is done.
+func (l *rateLimiter) Wait(ctx context.Context) error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	now := time.Now()
+	if l.next.Before(now) {
+		l.next = now
+	}
+	wait := l.next.Sub(now)
+	l.next = l.next.Add(l.interval)
+	l.mu.Unlock()
+
+	if wait <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 type takeoverFingerprint struct {
@@ -153,7 +223,7 @@ func (w *wildcardCache) entry(parent string) *wildcardEntry {
 // matches reports whether a resolvable random name under the host's parent
 // domain resolves to an address the host also uses, which means the name exists
 // because of a wildcard record rather than a real subdomain.
-func (w *wildcardCache) matches(ips []string, host string) bool {
+func (w *wildcardCache) matches(ctx context.Context, ips []string, host string) bool {
 	if w == nil || len(ips) == 0 {
 		return false
 	}
@@ -163,10 +233,10 @@ func (w *wildcardCache) matches(ips []string, host string) bool {
 	}
 	e := w.entry(parent)
 	e.once.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), w.timeout)
+		probeCtx, cancel := context.WithTimeout(ctx, w.timeout)
 		defer cancel()
 		random := randomLabel() + "." + parent
-		if resolved, err := lookupHostWithCtx(ctx, random, w.pool); err == nil {
+		if resolved, err := lookupHostWithCtx(probeCtx, random, w.pool); err == nil {
 			e.ips = resolved
 		}
 	})
@@ -183,7 +253,9 @@ func randomLabel() string {
 
 // parentDomain returns the registrable-ish parent used for a wildcard probe.
 // It is a heuristic (no public suffix list): aaa.bbb.example.com -> example.com
-// and aaa.bbb.example.co.uk -> example.co.uk.
+// and aaa.bbb.example.co.uk -> example.co.uk. Shared hosting suffixes such as
+// github.io return "", because probing them would flag every real project site
+// as a wildcard.
 func parentDomain(host string) string {
 	labels := strings.Split(host, ".")
 	if len(labels) < 3 {
@@ -195,7 +267,58 @@ func parentDomain(host string) string {
 	if len(tld) == 2 && len(labels) >= 4 && isCommonSecondLevel(second) {
 		keep = 3
 	}
-	return strings.Join(labels[len(labels)-keep:], ".")
+	parent := strings.Join(labels[len(labels)-keep:], ".")
+	if isSharedSuffix(parent) {
+		return ""
+	}
+	return parent
+}
+
+// sharedSuffixes are hosting suffixes where any label resolves, so a wildcard
+// probe against them proves nothing about a real subdomain.
+var sharedSuffixes = map[string]struct{}{
+	"amazonaws.com":          {},
+	"appspot.com":            {},
+	"azurefd.net":            {},
+	"azurewebsites.net":      {},
+	"blogspot.com":           {},
+	"cloudapp.net":           {},
+	"cloudfront.net":         {},
+	"digitaloceanspaces.com": {},
+	"firebaseapp.com":        {},
+	"fly.dev":                {},
+	"gitbook.io":             {},
+	"github.io":              {},
+	"gitlab.io":              {},
+	"glitch.me":              {},
+	"herokuapp.com":          {},
+	"herokudns.com":          {},
+	"linodeobjects.com":      {},
+	"myshopify.com":          {},
+	"netlify.app":            {},
+	"ngrok-free.app":         {},
+	"ngrok.io":               {},
+	"notion.site":            {},
+	"onrender.com":           {},
+	"pages.dev":              {},
+	"readme.io":              {},
+	"repl.co":                {},
+	"run.app":                {},
+	"storage.googleapis.com": {},
+	"surge.sh":               {},
+	"trafficmanager.net":     {},
+	"vercel.app":             {},
+	"web.app":                {},
+	"weebly.com":             {},
+	"wixsite.com":            {},
+	"wordpress.com":          {},
+	"workers.dev":            {},
+	"zendesk.com":            {},
+}
+
+func isSharedSuffix(parent string) bool {
+	_, ok := sharedSuffixes[strings.ToLower(strings.TrimSuffix(parent, "."))]
+	return ok
 }
 
 func isCommonSecondLevel(label string) bool {
@@ -224,16 +347,21 @@ func ipSetsOverlap(a, b []string) bool {
 
 var takeoverFingerprints = []takeoverFingerprint{
 	{Provider: "aws-s3", CNAMEs: []string{"s3.amazonaws.com", "s3-website", "amazonaws.com"}, Bodies: []string{"nosuchbucket", "the specified bucket does not exist"}},
-	{Provider: "github-pages", CNAMEs: []string{"github.io"}, Bodies: []string{"there isn't a github pages site here", "github pages"}},
+	{Provider: "github-pages", CNAMEs: []string{"github.io"}, Bodies: []string{"there isn't a github pages site here"}},
 	{Provider: "heroku", CNAMEs: []string{"herokuapp.com", "herokudns.com"}, Bodies: []string{"no such app", "heroku | no such app"}},
-	{Provider: "netlify", CNAMEs: []string{"netlify.app", "netlifyglobalcdn.com"}, Bodies: []string{"not found - request id", "netlify"}},
-	{Provider: "vercel", CNAMEs: []string{"vercel-dns.com", "vercel.app"}, Bodies: []string{"the deployment could not be found", "vercel"}},
-	{Provider: "azure", CNAMEs: []string{"azurewebsites.net", "cloudapp.net", "trafficmanager.net"}, Bodies: []string{"404 web site not found", "azure"}},
+	{Provider: "netlify", CNAMEs: []string{"netlify.app", "netlifyglobalcdn.com"}, Bodies: []string{"not found - request id"}},
+	{Provider: "vercel", CNAMEs: []string{"vercel-dns.com", "vercel.app"}, Bodies: []string{"the deployment could not be found"}},
+	{Provider: "azure", CNAMEs: []string{"azurewebsites.net", "cloudapp.net", "trafficmanager.net"}, Bodies: []string{"404 web site not found"}},
 	{Provider: "fastly", CNAMEs: []string{"fastly.net"}, Bodies: []string{"fastly error: unknown domain"}},
 	{Provider: "shopify", CNAMEs: []string{"myshopify.com"}, Bodies: []string{"sorry, this shop is currently unavailable"}},
 	{Provider: "zendesk", CNAMEs: []string{"zendesk.com"}, Bodies: []string{"help center closed", "oops, this help center no longer exists"}},
 	{Provider: "readme", CNAMEs: []string{"readme.io"}, Bodies: []string{"project doesnt exist", "project doesn't exist"}},
 }
+
+var (
+	errInterrupted = errors.New("interrupted")
+	lookPath       = exec.LookPath
+)
 
 func main() {
 	// Go's HTTP transport can log noisy "Unsolicited response received on idle
@@ -241,34 +369,73 @@ func main() {
 	// stream clean for pipelines.
 	log.SetOutput(io.Discard)
 
-	cfg, err := parseFlags(os.Args[1:])
-	if err != nil {
+	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
+		if errors.Is(err, errInterrupted) {
+			fmt.Fprintln(os.Stderr, "palm:", err)
+			os.Exit(130)
+		}
 		fatal(err)
 	}
+}
+
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	cfg, err := parseFlags(args)
+	if err != nil {
+		return err
+	}
+	cfg.progressOut = stderr
 	if cfg.inputFile == "" && stdinIsTerminal() {
-		fmt.Fprint(os.Stdout, usage())
-		return
+		fmt.Fprint(stdout, usageLang(cfg.lang))
+		return nil
 	}
 
-	hosts, err := readHosts(cfg.inputFile, os.Stdin)
+	hosts, err := readHosts(cfg.inputFile, stdin)
 	if err != nil {
-		fatal(err)
+		return err
 	}
 	if len(hosts) == 0 {
-		return
+		return nil
 	}
 
-	out, closeOut, err := outputWriter(cfg.outputFile)
-	if err != nil {
-		fatal(err)
-	}
-	defer closeOut()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
-	results, err := runChecks(hosts, cfg)
+	out, err := openResultWriter(cfg.outputFile, stdout)
 	if err != nil {
-		fatal(err)
+		return err
 	}
-	writeResults(out, results, cfg)
+	defer out.Abort()
+
+	var runErr error
+	if cfg.noSort {
+		// Same filters and formatting, written as each host finishes.
+		runErr = runChecks(ctx, hosts, cfg, func(res result) error {
+			return writeResult(out, res, cfg)
+		})
+	} else {
+		var collected []result
+		runErr = runChecks(ctx, hosts, cfg, func(res result) error {
+			collected = append(collected, res)
+			return nil
+		})
+		if runErr == nil {
+			sortResults(collected)
+			runErr = writeResults(out, collected, cfg)
+		}
+	}
+	if runErr != nil {
+		if isBrokenPipe(runErr) {
+			return nil
+		}
+		return runErr
+	}
+	if err := out.Commit(); err != nil {
+		return err
+	}
+	if ctx.Err() != nil {
+		return errInterrupted
+	}
+	return nil
 }
 
 func parseFlags(args []string) (config, error) {
@@ -280,7 +447,7 @@ func parseFlags(args []string) (config, error) {
 	fs.StringVar(&cfg.inputFile, "list", "", "subdomain list file")
 	fs.StringVar(&cfg.outputFile, "o", "", "output file")
 	fs.StringVar(&cfg.mode, "mode", "both", "check mode: dns, http, both")
-	fs.StringVar(&cfg.resolverFile, "r", "", "resolver file for DNS lookups")
+	fs.StringVar(&cfg.resolverFile, "r", "", "resolver file for DNS lookups and HTTP dials")
 	fs.IntVar(&cfg.concurrency, "c", 100, "concurrent workers")
 	timeout := fs.Int("timeout", 5, "timeout in seconds per phase (DNS, HTTP)")
 	matchCodes := fs.String("mc", "", "match HTTP status codes")
@@ -301,18 +468,30 @@ func parseFlags(args []string) (config, error) {
 	fs.BoolVar(&cfg.wildcard, "wildcard", false, "detect wildcard DNS and mark matching hosts")
 	fs.BoolVar(&cfg.filterWildcard, "fw", false, "drop hosts that match a wildcard DNS record")
 	fs.BoolVar(&cfg.quiet, "q", false, "only print live hosts/URLs")
+	lang := fs.String("lang", "", "help language: en, tr (default: auto)")
+	fs.Float64Var(&cfg.rate, "rate", 0, "max HTTP requests per second (0 = unlimited)")
+	fs.DurationVar(&cfg.delay, "delay", 0, "minimum delay between HTTP requests, e.g. 200ms")
+	fs.BoolVar(&cfg.noSort, "no-sort", false, "print results in completion order instead of host order")
+	fs.BoolVar(&cfg.progress, "progress", false, "print progress to stderr")
 	showHelp := fs.Bool("h", false, "show help")
+	fs.BoolVar(showHelp, "help", false, "show help")
 	showVersion := fs.Bool("version", false, "show version")
 	checkUpdate := fs.Bool("check-update", false, "check latest GitHub release")
-	runUpdate := fs.Bool("update", false, "update palm with go install")
+	runUpdate := fs.Bool("update", false, "self-update to the latest release")
 	showTools := fs.Bool("tools", false, "show common tool pipelines")
 	showMiami := fs.Bool("miami", false, "show the Miami easter egg")
 
 	if err := fs.Parse(reorderArgs(args)); err != nil {
-		return cfg, usageError()
+		return cfg, usageError(*lang)
+	}
+	cfg.lang = strings.ToLower(strings.TrimSpace(*lang))
+	switch cfg.lang {
+	case "", "en", "tr":
+	default:
+		return cfg, fmt.Errorf("invalid -lang: %s (use en or tr)", *lang)
 	}
 	if *showHelp {
-		fmt.Fprint(os.Stdout, usage())
+		fmt.Fprint(os.Stdout, usageLang(cfg.lang))
 		os.Exit(0)
 	}
 	if *showVersion {
@@ -332,7 +511,7 @@ func parseFlags(args []string) (config, error) {
 		os.Exit(0)
 	}
 	if *showTools {
-		fmt.Fprint(os.Stdout, localizedToolsUsage())
+		fmt.Fprint(os.Stdout, localizedToolsUsageLang(cfg.lang))
 		os.Exit(0)
 	}
 	if *showMiami {
@@ -351,6 +530,13 @@ func parseFlags(args []string) (config, error) {
 	if *timeout < 1 {
 		return cfg, errors.New("timeout must be greater than 0")
 	}
+	if cfg.rate < 0 {
+		return cfg, errors.New("rate must be zero or greater")
+	}
+	if cfg.delay < 0 {
+		return cfg, errors.New("delay must be zero or greater")
+	}
+	cfg.limiter = newRateLimiter(cfg.rate, cfg.delay)
 	var err error
 	cfg.headers, err = parseHeaders(headers)
 	if err != nil {
@@ -375,12 +561,16 @@ func parseFlags(args []string) (config, error) {
 	default:
 		return cfg, errors.New("mode must be one of: dns, http, both")
 	}
+	if (cfg.wildcard || cfg.filterWildcard) && cfg.mode == "http" {
+		return cfg, errors.New("-wildcard and -fw require -mode dns or both")
+	}
 	return cfg, nil
 }
 
 func reorderArgs(args []string) []string {
 	valueFlags := map[string]struct{}{
-		"-l": {}, "-list": {}, "-o": {}, "-mode": {}, "-r": {}, "-c": {}, "-timeout": {}, "-mc": {}, "-fc": {}, "-method": {}, "-H": {},
+		"-l": {}, "-list": {}, "-o": {}, "-mode": {}, "-r": {}, "-c": {}, "-timeout": {}, "-mc": {}, "-fc": {}, "-method": {}, "-H": {}, "-lang": {},
+		"-rate": {}, "-delay": {},
 	}
 
 	var flags []string
@@ -516,26 +706,267 @@ func latestRelease() (releaseInfo, error) {
 }
 
 func updatePalm(stdout, stderr io.Writer) error {
-	if _, err := exec.LookPath("go"); err != nil {
-		return errors.New("go command not found; install Go or download a binary from the GitHub releases page")
-	}
-	fmt.Fprintf(stdout, "updating palm with: go install %s@latest\n", modulePath)
-	cmd := exec.Command("go", "install", modulePath+"@latest")
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if err := cmd.Run(); err != nil {
+	latest, err := latestRelease()
+	if err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, "update complete")
-	fmt.Fprintln(stdout, "restart your shell or run `hash -r` if your shell cached the old binary")
+	return updatePalmTo(stdout, stderr, latest)
+}
+
+func updatePalmTo(stdout, stderr io.Writer, latest releaseInfo) error {
+	latestVersion := strings.TrimPrefix(latest.TagName, "v")
+	if latestVersion == version {
+		fmt.Fprintf(stdout, "palm %s is already the latest release\n", version)
+		return nil
+	}
+
+	fmt.Fprintf(stdout, "updating palm %s -> %s\n", version, latestVersion)
+	if err := selfUpdate(latest, stdout); err == nil {
+		fmt.Fprintln(stdout, "update complete")
+		fmt.Fprintln(stdout, "restart your shell or run `hash -r` if your shell cached the old binary")
+		return nil
+	} else {
+		fmt.Fprintf(stderr, "self-update failed: %v\n", err)
+	}
+
+	if _, err := lookPath("go"); err == nil {
+		fmt.Fprintf(stdout, "falling back to: go install %s@latest\n", modulePath)
+		cmd := exec.Command("go", "install", modulePath+"@latest")
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
+		if err := cmd.Run(); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, "update complete")
+		fmt.Fprintln(stdout, "restart your shell or run `hash -r` if your shell cached the old binary")
+		return nil
+	}
+
+	fmt.Fprintln(stdout, "go command not found; palm was probably installed from a release binary.")
+	fmt.Fprintln(stdout, "update with the installer for your platform:")
+	fmt.Fprintln(stdout)
+	fmt.Fprintln(stdout, "  Windows (PowerShell):")
+	fmt.Fprintln(stdout, "    irm https://raw.githubusercontent.com/kaaangumus/palm/main/install.ps1 | iex")
+	fmt.Fprintln(stdout)
+	fmt.Fprintln(stdout, "  Linux / macOS:")
+	fmt.Fprintln(stdout, "    curl -fsSL https://raw.githubusercontent.com/kaaangumus/palm/main/install.sh | sh")
+	fmt.Fprintln(stdout)
+	fmt.Fprintln(stdout, "release page: https://github.com/kaaangumus/palm/releases")
 	return nil
 }
 
-func usageError() error {
-	return errors.New(strings.TrimSpace(usage()))
+// assetNameFor maps a platform to the release asset name produced by the
+// release workflow.
+func assetNameFor(goos, goarch string) string {
+	name := "palm_" + goos + "_" + goarch
+	if goos == "windows" {
+		name += ".exe"
+	}
+	return name
+}
+
+func findAsset(assets []releaseAsset, name string) (releaseAsset, bool) {
+	for _, asset := range assets {
+		if asset.Name == name {
+			return asset, true
+		}
+	}
+	return releaseAsset{}, false
+}
+
+// selfUpdate replaces the running executable with the release asset for this
+// platform. The download is verified against checksums.txt when it is published
+// and the new binary must report the expected version before it is swapped in.
+func selfUpdate(latest releaseInfo, stdout io.Writer) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+
+	assetName := assetNameFor(runtime.GOOS, runtime.GOARCH)
+	asset, ok := findAsset(latest.Assets, assetName)
+	if !ok {
+		return fmt.Errorf("release %s has no %s asset", latest.TagName, assetName)
+	}
+
+	dir := filepath.Dir(exe)
+	if err := checkWritable(dir); err != nil {
+		return fmt.Errorf("%s is not writable (%v); retry with sudo", dir, err)
+	}
+
+	tmp, err := os.CreateTemp(dir, ".palm-update-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	fmt.Fprintf(stdout, "downloading %s\n", assetName)
+	if err := downloadTo(tmp, asset.URL); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	if expected, err := publishedChecksum(latest, assetName); err == nil && expected != "" {
+		sum, err := fileSHA256(tmpPath)
+		if err != nil {
+			return err
+		}
+		if !strings.EqualFold(sum, expected) {
+			return fmt.Errorf("checksum mismatch for %s", assetName)
+		}
+		fmt.Fprintln(stdout, "checksum verified")
+	}
+
+	if err := os.Chmod(tmpPath, 0o755); err != nil && runtime.GOOS != "windows" {
+		return err
+	}
+
+	wantVersion := strings.TrimPrefix(latest.TagName, "v")
+	if out, err := exec.Command(tmpPath, "-version").Output(); err == nil {
+		if !strings.Contains(string(out), wantVersion) {
+			return fmt.Errorf("downloaded binary reports %q, expected %s", strings.TrimSpace(string(out)), wantVersion)
+		}
+	}
+
+	if err := replaceExecutable(tmpPath, exe); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+func checkWritable(dir string) error {
+	probe, err := os.CreateTemp(dir, ".palm-write-*")
+	if err != nil {
+		return err
+	}
+	name := probe.Name()
+	_ = probe.Close()
+	return os.Remove(name)
+}
+
+func downloadTo(dst *os.File, url string) error {
+	client := &http.Client{Timeout: 5 * time.Minute}
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "palm/"+version)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download failed: %s", resp.Status)
+	}
+	_, err = io.Copy(dst, resp.Body)
+	return err
+}
+
+// publishedChecksum returns the sha256 for an asset from checksums.txt, which
+// the release workflow publishes next to the binaries.
+func publishedChecksum(latest releaseInfo, assetName string) (string, error) {
+	checksums, ok := findAsset(latest.Assets, "checksums.txt")
+	if !ok {
+		return "", nil
+	}
+	client := &http.Client{Timeout: time.Minute}
+	req, err := http.NewRequest(http.MethodGet, checksums.URL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "palm/"+version)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("checksums download failed: %s", resp.Status)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	return parseChecksums(string(data), assetName), nil
+}
+
+// parseChecksums reads "hash  filename" lines, the format of sha256sum output.
+func parseChecksums(text, assetName string) string {
+	for _, line := range strings.Split(text, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		name := strings.TrimPrefix(fields[len(fields)-1], "*")
+		if name == assetName {
+			return fields[0]
+		}
+	}
+	return ""
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// replaceExecutable swaps the running binary. Renaming the old file aside first
+// keeps the operation recoverable and works on Windows, where a running image
+// can be renamed but not overwritten.
+func replaceExecutable(newPath, target string) error {
+	backup := target + ".old"
+	_ = os.Remove(backup)
+
+	if err := os.Rename(target, backup); err != nil {
+		return err
+	}
+	if err := os.Rename(newPath, target); err != nil {
+		_ = os.Rename(backup, target)
+		return err
+	}
+	_ = os.Remove(backup)
+	return nil
+}
+
+func usageError(lang string) error {
+	return errors.New(strings.TrimSpace(usageLang(lang)))
 }
 
 func usage() string {
+	return usageLang("")
+}
+
+// usageLang picks the help language: "en" and "tr" force one, anything else
+// (including "") follows the locale.
+func usageLang(lang string) string {
+	switch strings.ToLower(strings.TrimSpace(lang)) {
+	case "tr":
+		return trUsageFresh()
+	case "en":
+		return enUsage()
+	}
 	if isTurkishLocale() {
 		return trUsageFresh()
 	}
@@ -556,7 +987,7 @@ Flags:
   -l, -list string   subdomain list file
   -o string          output file
   -mode string       dns, http, both (default "both")
-  -r string          resolver file for DNS lookups
+  -r string          resolver file for DNS lookups and HTTP dials
   -c int             concurrent workers (default 100)
   -timeout int       timeout in seconds per phase (DNS, HTTP) (default 5)
   -mc string         match HTTP status codes, comma-separated
@@ -576,11 +1007,16 @@ Flags:
   -wildcard          detect wildcard DNS and mark matching hosts
   -fw                drop hosts that match a wildcard DNS record
   -q                 only print live URLs, bare and pipe-friendly
+  -no-sort           print in completion order instead of host order
+  -progress          print progress to stderr
+  -rate float        max HTTP requests per second (0 = unlimited)
+  -delay duration    minimum delay between HTTP requests, e.g. 200ms
+  -lang string       help language: en, tr (default: auto)
   -tools             show common tool pipelines
   -check-update      check latest GitHub release
-  -update            update palm with go install
+  -update            self-update to the latest release
   -version           show version
-  -h                 show help
+  -h, -help          show help
 `
 }
 
@@ -599,7 +1035,7 @@ Parametreler:
   -l, -list string   subdomain liste dosyasi
   -o string          cikti dosyasi
   -mode string       kontrol modu: dns, http, both (varsayilan "both")
-  -r string          DNS sorgulari icin resolver dosyasi
+  -r string          DNS sorgulari ve HTTP baglantilari icin resolver dosyasi
   -c int             eszamanli worker sayisi (varsayilan 100)
   -timeout int       asama basina saniye cinsinden timeout: DNS, HTTP (varsayilan 5)
   -mc string         eslesecek HTTP status kodlari, virgulle ayrilir
@@ -619,11 +1055,16 @@ Parametreler:
   -wildcard          wildcard DNS tespit et ve eslesen hostlari isaretle
   -fw                wildcard DNS kaydiyla eslesen hostlari ele
   -q                 sadece live URL yaz, sade ve pipe dostu
+  -no-sort           host sirasi yerine tamamlanma sirasina gore yaz
+  -progress          stderr'e ilerleme yaz
+  -rate float        saniyedeki en fazla HTTP istegi (0 = sinirsiz)
+  -delay duration    HTTP istekleri arasi en az bekleme, orn. 200ms
+  -lang string       yardim dili: en, tr (varsayilan: otomatik)
   -tools             yaygin araclarla ornek pipeline goster
   -check-update      en son GitHub release surumunu kontrol et
-  -update            go install ile palm'i guncelle
+  -update            palm'i son surume kendi kendine guncelle
   -version           surumu goster
-  -h                 yardimi goster
+  -h, -help          yardimi goster
 `
 }
 
@@ -638,8 +1079,24 @@ func isTurkishLocale() bool {
 }
 
 func localizedToolsUsage() string {
+	return localizedToolsUsageLang("")
+}
+
+func localizedToolsUsageLang(lang string) string {
+	switch strings.ToLower(strings.TrimSpace(lang)) {
+	case "tr":
+		return trToolsUsage()
+	case "en":
+		return toolsUsage()
+	}
 	if isTurkishLocale() {
-		return `palm ile yaygin arac ornekleri:
+		return trToolsUsage()
+	}
+	return toolsUsage()
+}
+
+func trToolsUsage() string {
+	return `palm ile yaygin arac ornekleri:
 
   subfinder -d example.com -silent | palm
   assetfinder --subs-only example.com | palm
@@ -649,8 +1106,6 @@ func localizedToolsUsage() string {
 
 Not: palm stdin'den okur, txt dosyasi da kabul eder: palm subs.txt
 `
-	}
-	return toolsUsage()
 }
 
 func toolsUsage() string {
@@ -760,49 +1215,108 @@ func normalizeHost(line string) string {
 	return raw
 }
 
-func outputWriter(path string) (io.Writer, func(), error) {
-	if path == "" {
-		return os.Stdout, func() {}, nil
-	}
-	f, err := os.Create(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	return f, func() { _ = f.Close() }, nil
+type resultWriter struct {
+	w         io.Writer
+	file      *os.File
+	tmpPath   string
+	finalPath string
+	committed bool
 }
 
-func runChecks(hosts []string, cfg config) ([]result, error) {
-	resolvers, err := loadResolverPool(cfg.resolverFile)
+// openResultWriter keeps the destination untouched until Commit, so an
+// interrupted or failed scan never truncates an existing output file.
+func openResultWriter(path string, stdout io.Writer) (*resultWriter, error) {
+	if path == "" {
+		return &resultWriter{w: stdout}, nil
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), ".palm-*.tmp")
 	if err != nil {
 		return nil, err
 	}
+	return &resultWriter{w: f, file: f, tmpPath: f.Name(), finalPath: path}, nil
+}
+
+func (rw *resultWriter) Write(p []byte) (int, error) {
+	return rw.w.Write(p)
+}
+
+func (rw *resultWriter) Commit() error {
+	if rw.file == nil {
+		return nil
+	}
+	if err := rw.file.Close(); err != nil {
+		rw.file = nil
+		_ = os.Remove(rw.tmpPath)
+		return err
+	}
+	mode := os.FileMode(0o644)
+	if info, err := os.Stat(rw.finalPath); err == nil {
+		mode = info.Mode().Perm()
+	}
+	_ = os.Chmod(rw.tmpPath, mode)
+	if err := os.Rename(rw.tmpPath, rw.finalPath); err != nil {
+		rw.file = nil
+		_ = os.Remove(rw.tmpPath)
+		return err
+	}
+	rw.file = nil
+	rw.committed = true
+	return nil
+}
+
+func (rw *resultWriter) Abort() {
+	if rw.file == nil || rw.committed {
+		return
+	}
+	_ = rw.file.Close()
+	_ = os.Remove(rw.tmpPath)
+	rw.file = nil
+}
+
+func runChecks(ctx context.Context, hosts []string, cfg config, emit func(result) error) error {
+	if emit == nil {
+		emit = func(result) error { return nil }
+	}
+	resolvers, err := loadResolverPool(cfg.resolverFile)
+	if err != nil {
+		return err
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	jobs := make(chan string)
-	results := make(chan result)
+	results := make(chan result, cfg.concurrency)
 
 	var wildcards *wildcardCache
 	if cfg.wildcard || cfg.filterWildcard {
 		wildcards = newWildcardCache(resolvers, cfg.timeout)
 	}
 
-	client := &http.Client{
-		Timeout: cfg.timeout,
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			// Setting a custom TLSClientConfig disables Go's automatic HTTP/2
-			// upgrade; ForceAttemptHTTP2 keeps h2 for hosts that support it.
-			ForceAttemptHTTP2: true,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
-			MaxIdleConns:        cfg.concurrency * 2,
-			MaxIdleConnsPerHost: 4,
-			IdleConnTimeout:     30 * time.Second,
-		},
-	}
-	if !cfg.followRedirects {
-		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
+	client := newHTTPClient(cfg, resolvers)
+
+	var progress *progressState
+	if cfg.progress && cfg.progressOut != nil {
+		progress = &progressState{total: len(hosts), start: time.Now()}
+		stopProgress := make(chan struct{})
+		progressDone := make(chan struct{})
+		go func() {
+			defer close(progressDone)
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					fmt.Fprintln(cfg.progressOut, progress.line())
+				case <-stopProgress:
+					return
+				}
+			}
+		}()
+		defer func() {
+			close(stopProgress)
+			<-progressDone
+		}()
 	}
 
 	var wg sync.WaitGroup
@@ -811,44 +1325,129 @@ func runChecks(hosts []string, cfg config) ([]result, error) {
 		go func() {
 			defer wg.Done()
 			for host := range jobs {
-				results <- checkHost(host, cfg, client, resolvers, wildcards)
+				res := checkHost(runCtx, host, cfg, client, resolvers, wildcards)
+				select {
+				case results <- res:
+				case <-runCtx.Done():
+					return
+				}
 			}
 		}()
 	}
 
 	go func() {
+		defer close(jobs)
 		for _, host := range hosts {
-			jobs <- host
+			select {
+			case jobs <- host:
+			case <-runCtx.Done():
+				return
+			}
 		}
-		close(jobs)
+	}()
+
+	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	return collectResults(results), nil
+	var emitErr error
+	for res := range results {
+		if progress != nil {
+			progress.add(res)
+		}
+		if emitErr != nil {
+			continue // drain so the workers can finish
+		}
+		if err := emit(res); err != nil {
+			emitErr = err
+			cancel()
+		}
+	}
+	if progress != nil && emitErr == nil {
+		fmt.Fprintln(cfg.progressOut, progress.line())
+	}
+	return emitErr
 }
 
-func collectResults(results <-chan result) []result {
-	out := make([]result, 0)
-	for res := range results {
-		out = append(out, res)
+// progressState tracks scan counters for -progress. The results loop is the
+// only writer, so the mutex protects readers only.
+type progressState struct {
+	mu     sync.Mutex
+	total  int
+	done   int
+	live   int
+	failed int
+	start  time.Time
+}
+
+func (p *progressState) add(res result) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.done++
+	if res.Live {
+		p.live++
+	} else {
+		p.failed++
 	}
+}
+
+func (p *progressState) line() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	percent := 0
+	if p.total > 0 {
+		percent = p.done * 100 / p.total
+	}
+	return fmt.Sprintf("palm: %d/%d checked (%d%%), %d live, %d failed, %s",
+		p.done, p.total, percent, p.live, p.failed, time.Since(p.start).Round(time.Second))
+}
+
+func newHTTPClient(cfg config, resolvers *resolverPool) *http.Client {
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		// Setting a custom TLSClientConfig disables Go's automatic HTTP/2
+		// upgrade; ForceAttemptHTTP2 keeps h2 for hosts that support it.
+		ForceAttemptHTTP2: true,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		MaxIdleConns:        cfg.concurrency * 2,
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     30 * time.Second,
+	}
+	if resolvers != nil {
+		transport.DialContext = resolvers.dialContext(cfg.timeout)
+	}
+
+	client := &http.Client{
+		Timeout:   cfg.timeout,
+		Transport: transport,
+	}
+	if !cfg.followRedirects {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
+	return client
+}
+
+func sortResults(out []result) {
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].Host < out[j].Host
 	})
-	return out
 }
 
-func checkHost(host string, cfg config, client *http.Client, resolvers *resolverPool, wildcards *wildcardCache) result {
+func checkHost(ctx context.Context, host string, cfg config, client *http.Client, resolvers *resolverPool, wildcards *wildcardCache) result {
 	res := result{Host: host}
 
 	if cfg.mode == "dns" || cfg.mode == "both" {
-		ips, err := lookupHost(host, cfg.timeout, resolvers)
+		ips, err := lookupHost(ctx, host, cfg.timeout, resolvers)
 		if err == nil && len(ips) > 0 {
 			res.DNS = true
 			res.IPs = ips
 			res.Live = true
-			if wildcards != nil && wildcards.matches(ips, host) {
+			if wildcards != nil && wildcards.matches(ctx, ips, host) {
 				res.Wildcard = true
 			}
 		} else {
@@ -861,8 +1460,8 @@ func checkHost(host string, cfg config, client *http.Client, resolvers *resolver
 	if cfg.mode == "http" || cfg.mode == "both" {
 		// Both schemes are probed in parallel under one budget, so a host that
 		// blackholes 443 still gets its HTTP chance within -timeout.
-		ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
-		probe, err := checkHTTP(ctx, host, cfg, client)
+		httpCtx, cancel := context.WithTimeout(ctx, cfg.timeout)
+		probe, err := checkHTTP(httpCtx, host, cfg, client)
 		cancel()
 		if err == nil {
 			res.Live = true
@@ -888,7 +1487,7 @@ func checkHost(host string, cfg config, client *http.Client, resolvers *resolver
 	}
 
 	if cfg.takeover {
-		takeover, provider, cname := detectTakeover(host, cfg.timeout, resolvers, client)
+		takeover, provider, cname := detectTakeover(ctx, host, cfg.timeout, resolvers, client, cfg.limiter)
 		res.CNAME = cname
 		res.Takeover = takeover
 		res.Provider = provider
@@ -900,10 +1499,10 @@ func checkHost(host string, cfg config, client *http.Client, resolvers *resolver
 	return res
 }
 
-func lookupHost(host string, timeout time.Duration, resolvers *resolverPool) ([]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func lookupHost(ctx context.Context, host string, timeout time.Duration, resolvers *resolverPool) ([]string, error) {
+	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return lookupHostWithCtx(ctx, host, resolvers)
+	return lookupHostWithCtx(lookupCtx, host, resolvers)
 }
 
 func lookupHostWithCtx(ctx context.Context, host string, resolvers *resolverPool) ([]string, error) {
@@ -915,26 +1514,26 @@ func lookupHostWithCtx(ctx context.Context, host string, resolvers *resolverPool
 	return ips, nil
 }
 
-func detectTakeover(host string, timeout time.Duration, resolvers *resolverPool, client *http.Client) (bool, string, string) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func detectTakeover(ctx context.Context, host string, timeout time.Duration, resolvers *resolverPool, client *http.Client, limiter *rateLimiter) (bool, string, string) {
+	takeoverCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cname, err := lookupCNAME(ctx, host, resolvers)
+	cname, err := lookupCNAME(takeoverCtx, host, resolvers)
 	if err != nil || cname == "" {
 		return false, "", ""
 	}
-	return evaluateTakeover(host, cname, client)
+	return evaluateTakeover(takeoverCtx, host, cname, client, limiter)
 }
 
 // evaluateTakeover keeps the resolved CNAME even when no takeover fingerprint
 // matches, so `-takeover -json` still shows the CNAME chain for manual review.
-func evaluateTakeover(host, cname string, client *http.Client) (bool, string, string) {
+func evaluateTakeover(ctx context.Context, host, cname string, client *http.Client, limiter *rateLimiter) (bool, string, string) {
 	fingerprint, ok := matchTakeoverCNAME(cname)
 	if !ok {
 		return false, "", cname
 	}
 
-	body := fetchTakeoverBody(host, client)
+	body := fetchTakeoverBody(ctx, host, client, limiter)
 	if body == "" {
 		return false, "", cname
 	}
@@ -952,7 +1551,7 @@ func matchTakeoverCNAME(cname string) (takeoverFingerprint, bool) {
 	cname = strings.ToLower(strings.TrimSuffix(cname, "."))
 	for _, fp := range takeoverFingerprints {
 		for _, pattern := range fp.CNAMEs {
-			if strings.Contains(cname, strings.ToLower(pattern)) {
+			if cnameMatchesPattern(cname, strings.ToLower(pattern)) {
 				return fp, true
 			}
 		}
@@ -960,9 +1559,30 @@ func matchTakeoverCNAME(cname string) (takeoverFingerprint, bool) {
 	return takeoverFingerprint{}, false
 }
 
-func fetchTakeoverBody(host string, client *http.Client) string {
+// cnameMatchesPattern matches whole DNS labels, so "amazonaws.com" does not
+// match "notamazonaws.com". Patterns without a dot (such as "s3-website")
+// match a label prefix, which covers "bucket.s3-website-us-east-1...".
+func cnameMatchesPattern(cname, pattern string) bool {
+	if pattern == "" {
+		return false
+	}
+	if strings.Contains(pattern, ".") {
+		return cname == pattern || strings.HasSuffix(cname, "."+pattern)
+	}
+	for _, label := range strings.Split(cname, ".") {
+		if label == pattern || strings.HasPrefix(label, pattern+"-") {
+			return true
+		}
+	}
+	return false
+}
+
+func fetchTakeoverBody(ctx context.Context, host string, client *http.Client, limiter *rateLimiter) string {
 	for _, scheme := range []string{"https", "http"} {
-		req, err := http.NewRequest(http.MethodGet, scheme+"://"+host, nil)
+		if err := limiter.Wait(ctx); err != nil {
+			return ""
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, scheme+"://"+host, nil)
 		if err != nil {
 			continue
 		}
@@ -1089,6 +1709,34 @@ func (p *resolverPool) lookupCNAME(ctx context.Context, host string) (string, er
 	return p.resolvers[int(idx-1)%len(p.resolvers)].LookupCNAME(ctx, host)
 }
 
+// dialContext resolves the target through the pool, so -r applies to HTTP
+// connections as well as to the DNS phase. IP literals are dialed directly.
+func (p *resolverPool) dialContext(timeout time.Duration) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: timeout}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil || net.ParseIP(host) != nil {
+			return dialer.DialContext(ctx, network, addr)
+		}
+		ips, err := p.lookupHost(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		var lastErr error
+		for _, ip := range ips {
+			conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+		if lastErr == nil {
+			lastErr = fmt.Errorf("no addresses for %s", host)
+		}
+		return nil, lastErr
+	}
+}
+
 // schemePreferenceGrace is how long an HTTP result waits for a still-pending
 // HTTPS attempt before it is returned. It keeps HTTPS preferred without paying
 // a full timeout for HTTP-only hosts.
@@ -1193,6 +1841,9 @@ func isTimeoutErr(err error) bool {
 }
 
 func doRequest(ctx context.Context, target, method string, cfg config, client *http.Client) (httpProbe, error) {
+	if err := cfg.limiter.Wait(ctx); err != nil {
+		return httpProbe{}, err
+	}
 	req, err := http.NewRequestWithContext(ctx, method, target, nil)
 	if err != nil {
 		return httpProbe{}, err
@@ -1359,13 +2010,13 @@ const titleReadLimit = 256 * 1024
 // readTitle streams the body and stops as soon as the title is complete (or the
 // head ends), instead of reading the whole capped body every time.
 func readTitle(r io.Reader) string {
-	buf := make([]byte, 0, 8192)
+	s := titleScan{}
 	chunk := make([]byte, 8192)
-	for len(buf) < titleReadLimit {
+	for len(s.buf) < titleReadLimit {
 		n, err := r.Read(chunk)
 		if n > 0 {
-			buf = append(buf, chunk[:n]...)
-			if title, done := titleFromBuffer(buf); done {
+			s.buf = append(s.buf, chunk[:n]...)
+			if title, done := s.scan(); done {
 				return title
 			}
 		}
@@ -1373,28 +2024,104 @@ func readTitle(r io.Reader) string {
 			break
 		}
 	}
-	title, _ := titleFromBuffer(buf)
+	title, _ := s.scan()
 	return title
+}
+
+// titleScan finds a <title> element in a growing buffer without rescanning bytes
+// it has already looked at. Each search remembers where it stopped and keeps one
+// needle-length of overlap so a tag split across two reads is still found.
+type titleScan struct {
+	buf       []byte
+	searchAt  int // next index to start searching for the current needle
+	headAt    int // next index to start searching for </head>
+	bodyStart int // first byte of the title text
+	inBody    bool
+}
+
+func (s *titleScan) scan() (string, bool) {
+	for {
+		if !s.inBody {
+			idx := indexFoldASCIIFrom(s.buf, "<title", s.searchAt)
+			head := indexFoldASCIIFrom(s.buf, "</head>", s.headAt)
+			// </head> before any <title means the head has no title.
+			if idx < 0 || (head >= 0 && head < idx) {
+				if head >= 0 {
+					return "", true
+				}
+				s.searchAt = keepOverlap(s.buf, s.searchAt, len("<title"))
+				s.headAt = keepOverlap(s.buf, s.headAt, len("</head>"))
+				return "", false
+			}
+			open := bytes.IndexByte(s.buf[idx:], '>')
+			if open < 0 {
+				s.searchAt = idx
+				return "", false
+			}
+			s.inBody = true
+			s.bodyStart = idx + open + 1
+			s.searchAt = s.bodyStart
+			continue
+		}
+
+		end := indexFoldASCIIFrom(s.buf, "</title>", s.searchAt)
+		if end < 0 {
+			s.searchAt = keepOverlap(s.buf, s.bodyStart, len("</title>"))
+			return "", false
+		}
+		return strings.Join(strings.Fields(string(s.buf[s.bodyStart:end])), " "), true
+	}
+}
+
+// keepOverlap moves the search cursor forward but leaves (needleLen-1) bytes of
+// the buffer to be re-examined, so a needle split across reads is not missed.
+func keepOverlap(data []byte, from, needleLen int) int {
+	next := len(data) - (needleLen - 1)
+	if next < from {
+		return from
+	}
+	return next
 }
 
 // titleFromBuffer reports the title and whether the scan can stop: found the
 // closing tag, or the document head ended without a title.
 func titleFromBuffer(data []byte) (string, bool) {
-	lower := strings.ToLower(string(data))
-	start := strings.Index(lower, "<title")
-	if start < 0 {
-		return "", strings.Contains(lower, "</head>")
+	s := titleScan{buf: data}
+	return s.scan()
+}
+
+// indexFoldASCII searches for a lowercase ASCII needle without changing the
+// byte offsets of the haystack. Lowercasing the whole buffer is wrong: Unicode
+// case mapping can change byte lengths, which shifts every index after it.
+func indexFoldASCII(data []byte, needle string) int {
+	return indexFoldASCIIFrom(data, needle, 0)
+}
+
+// indexFoldASCIIFrom is indexFoldASCII starting at offset from.
+func indexFoldASCIIFrom(data []byte, needle string, from int) int {
+	if needle == "" || len(data) < len(needle) {
+		return -1
 	}
-	open := strings.IndexByte(lower[start:], '>')
-	if open < 0 {
-		return "", false
+	if from < 0 {
+		from = 0
 	}
-	body := start + open + 1
-	end := strings.Index(lower[body:], "</title>")
-	if end < 0 {
-		return "", strings.Contains(lower[body:], "</head>")
+	for i := from; i+len(needle) <= len(data); i++ {
+		match := true
+		for j := 0; j < len(needle); j++ {
+			c := data[i+j]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
 	}
-	return strings.Join(strings.Fields(string(data[body:body+end])), " "), true
+	return -1
 }
 
 func sameURL(a, b string) bool {
@@ -1423,36 +2150,52 @@ func shortErr(err error) string {
 	return msg
 }
 
-func writeResults(w io.Writer, results []result, cfg config) {
-	enc := json.NewEncoder(w)
+func writeResults(w io.Writer, results []result, cfg config) error {
 	for _, res := range results {
-		if cfg.filterWildcard && res.Wildcard {
-			continue
-		}
-		if cfg.quiet && !res.Live {
-			continue
-		}
-		if !cfg.jsonOut && !res.Live {
-			continue
-		}
-
-		if cfg.jsonOut {
-			_ = enc.Encode(res)
-			continue
-		}
-
-		if cfg.quiet {
-			fmt.Fprintln(w, resultURL(res))
-			continue
-		}
-
-		switch cfg.mode {
-		case "dns":
-			fmt.Fprintln(w, formatDNSResult(res, cfg))
-		default:
-			fmt.Fprintln(w, formatHTTPResult(res, cfg))
+		if err := writeResult(w, res, cfg); err != nil {
+			return err
 		}
 	}
+	return nil
+}
+
+// writeResult applies the output filters and writes one result. Both the sorted
+// and the streaming (-no-sort) paths go through it so their output matches.
+func writeResult(w io.Writer, res result, cfg config) error {
+	if cfg.filterWildcard && res.Wildcard {
+		return nil
+	}
+	if !res.Live && !cfg.jsonOut {
+		return nil
+	}
+
+	if cfg.jsonOut {
+		return json.NewEncoder(w).Encode(res)
+	}
+
+	if cfg.quiet {
+		_, err := fmt.Fprintln(w, resultURL(res))
+		return err
+	}
+
+	switch cfg.mode {
+	case "dns":
+		_, err := fmt.Fprintln(w, formatDNSResult(res, cfg))
+		return err
+	default:
+		_, err := fmt.Fprintln(w, formatHTTPResult(res, cfg))
+		return err
+	}
+}
+
+// isBrokenPipe lets "palm | head" exit cleanly instead of reporting the
+// consumer's early close as a scan failure.
+func isBrokenPipe(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "broken pipe") || strings.Contains(msg, "pipe is being closed")
 }
 
 func resultURL(res result) string {

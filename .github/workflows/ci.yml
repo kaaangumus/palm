@@ -27,13 +27,45 @@ jobs:
         run: test -z "$(gofmt -l .)"
 
       - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # Advisory while the tree is brought to a clean staticcheck/govulncheck
+      # baseline; remove continue-on-error once both report zero findings.
+      - name: Staticcheck
+        continue-on-error: true
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.5.1 ./...
+
+      - name: Govulncheck
+        continue-on-error: true
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+      - name: Build
+        run: go build -o palm .
+
+  test-windows:
+    name: Test (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
         run: go test -count=1 ./...
 
       - name: Vet
         run: go vet ./...
 
       - name: Build
-        run: go build -o palm .
+        run: go build -o palm.exe .
 
   installer-scripts:
     name: Installer scripts
@@ -44,6 +76,12 @@ jobs:
 
       - name: Shell syntax (install.sh)
         run: sh -n install.sh
+
+      # Advisory until the existing script is brought to a clean ShellCheck
+      # baseline; remove continue-on-error once it reports zero findings.
+      - name: ShellCheck (install.sh)
+        continue-on-error: true
+        run: shellcheck install.sh
 
       - name: PowerShell syntax (install.ps1)
         shell: pwsh
