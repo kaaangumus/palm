@@ -969,13 +969,154 @@ func TestDoRequestKeepsTitleForSameHostRedirect(t *testing.T) {
 	}
 }
 
-func TestEvaluateTakeoverKeepsCNAMEWithoutFingerprintMatch(t *testing.T) {
-	takeover, provider, cname := evaluateTakeover(context.Background(), "shop.example.com", "shop.example.com.", http.DefaultClient, nil)
-	if takeover || provider != "" {
-		t.Fatalf("takeover=%v provider=%q, want no match", takeover, provider)
+func TestDecideTakeoverDanglingProviderTarget(t *testing.T) {
+	// A removed Elastic Beanstalk environment leaves the CNAME pointing at a
+	// name that no longer resolves. The old code could not see this at all.
+	tr := decideTakeover(takeoverResult{CNAME: "gone.elasticbeanstalk.com.", Dangling: true}, true, "")
+	if !tr.Vulnerable || tr.Provider != "aws-elasticbeanstalk" {
+		t.Fatalf("got vulnerable=%v provider=%q, want aws-elasticbeanstalk takeover", tr.Vulnerable, tr.Provider)
 	}
-	if cname != "shop.example.com." {
-		t.Fatalf("cname = %q, want the resolved CNAME even without a match", cname)
+}
+
+func TestDecideTakeoverAzureDangling(t *testing.T) {
+	tr := decideTakeover(takeoverResult{CNAME: "app.azurewebsites.net.", Dangling: true}, true, "")
+	if !tr.Vulnerable || tr.Provider != "azure" {
+		t.Fatalf("got vulnerable=%v provider=%q, want azure takeover", tr.Vulnerable, tr.Provider)
+	}
+}
+
+func TestDecideTakeoverDanglingNotClaimable(t *testing.T) {
+	// CNAME target is gone but the provider cannot hand out names, so this is a
+	// dangling record, not a takeover.
+	tr := decideTakeover(takeoverResult{CNAME: "gone.internal.example.com.", Dangling: true}, false, "")
+	if tr.Vulnerable {
+		t.Fatalf("reported a takeover for an unlisted provider: %+v", tr)
+	}
+	if !tr.Dangling {
+		t.Fatal("dangling flag must survive so the record can be reviewed")
+	}
+}
+
+func TestDecideTakeoverNXDomainButStillResolves(t *testing.T) {
+	tr := decideTakeover(takeoverResult{CNAME: "bucket.s3.amazonaws.com."}, true, "")
+	if tr.Vulnerable {
+		t.Fatal("a live S3 target must not be reported as a takeover")
+	}
+}
+
+func TestDecideTakeoverBodyFingerprints(t *testing.T) {
+	tests := []struct {
+		name    string
+		cname   string
+		body    string
+		want    bool
+		provide string
+	}{
+		{"s3 error page", "bucket.s3.amazonaws.com.", "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>", true, "aws-s3"},
+		{"github pages", "project.github.io.", "There isn't a GitHub Pages site here.", true, "github-pages"},
+		{"pantheon has no cname", "", "404 error unknown site!", true, "pantheon"},
+		{"canny has no cname", "", "Company Not Found", true, "canny"},
+		{"healthy s3 page", "bucket.s3.amazonaws.com.", "<html>my files</html>", false, ""},
+		{"unrelated page", "example.com.", "<html>hello</html>", false, ""},
+		{"zendesk text is not a fingerprint any more", "help.zendesk.com.", "Help Center Closed", false, ""},
+	}
+	for _, tc := range tests {
+		tr := decideTakeover(takeoverResult{CNAME: tc.cname}, tc.cname != "", tc.body)
+		if tr.Vulnerable != tc.want {
+			t.Errorf("%s: vulnerable = %v, want %v", tc.name, tr.Vulnerable, tc.want)
+		}
+		if tc.want && tr.Provider != tc.provide {
+			t.Errorf("%s: provider = %q, want %q", tc.name, tr.Provider, tc.provide)
+		}
+	}
+}
+
+func TestDecideTakeoverBodyAll(t *testing.T) {
+	fp, ok := matchTakeoverCNAME("abc.ngrok.io.")
+	if !ok {
+		t.Fatal("ngrok CNAME should match")
+	}
+	if matchTakeoverBody("tunnel not found", fp) {
+		t.Fatal("BodyAll must not match on a partial phrase")
+	}
+	if !matchTakeoverBody("tunnel abc.ngrok.io not found", fp) {
+		t.Fatal("BodyAll should match when every part is present")
+	}
+}
+
+func TestCnameTargetMissing(t *testing.T) {
+	old := lookupHostForTakeover
+	defer func() { lookupHostForTakeover = old }()
+
+	nxdomain := &net.DNSError{Err: "no such host", Name: "gone.elasticbeanstalk.com", IsNotFound: true}
+	lookupHostForTakeover = func(ctx context.Context, host string, _ *resolverPool) ([]string, error) {
+		if host == "gone.elasticbeanstalk.com" {
+			return nil, nxdomain
+		}
+		return []string{"1.2.3.4"}, nil
+	}
+
+	ctx := context.Background()
+	if !cnameTargetMissing(ctx, "old.example.com", "gone.elasticbeanstalk.com.", nil) {
+		t.Fatal("an NXDOMAIN CNAME target must be reported as dangling")
+	}
+	if cnameTargetMissing(ctx, "ok.example.com", "live.elasticbeanstalk.com.", nil) {
+		t.Fatal("a resolving CNAME target must not be dangling")
+	}
+	// LookupCNAME returns the host itself (with a trailing dot) when the name has
+	// no CNAME record; that must never be probed as a target.
+	if cnameTargetMissing(ctx, "example.com", "example.com.", nil) {
+		t.Fatal("a host without a CNAME record must not be dangling")
+	}
+	if cnameTargetMissing(ctx, "example.com", "EXAMPLE.COM.", nil) {
+		t.Fatal("the comparison must be case-insensitive")
+	}
+}
+
+func TestDetectTakeoverFlagsDanglingProvider(t *testing.T) {
+	old := lookupHostForTakeover
+	defer func() { lookupHostForTakeover = old }()
+
+	lookupHostForTakeover = func(ctx context.Context, host string, _ *resolverPool) ([]string, error) {
+		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	}
+	oldCNAME := lookupCNAMEFunc
+	defer func() { lookupCNAMEFunc = oldCNAME }()
+	lookupCNAMEFunc = func(ctx context.Context, host string, _ *resolverPool) (string, error) {
+		return "gone.elasticbeanstalk.com.", nil
+	}
+
+	tr := detectTakeover(context.Background(), "old.example.com", time.Second, nil, http.DefaultClient, nil, false)
+	if !tr.Vulnerable || tr.Provider != "aws-elasticbeanstalk" {
+		t.Fatalf("got vulnerable=%v provider=%q, want aws-elasticbeanstalk", tr.Vulnerable, tr.Provider)
+	}
+	if !tr.Dangling {
+		t.Fatal("dangling flag should be set")
+	}
+}
+
+func TestIsNXDomain(t *testing.T) {
+	if !isNXDomain(&net.DNSError{Err: "no such host", Name: "x", IsNotFound: true}) {
+		t.Fatal("IsNotFound should count as NXDOMAIN")
+	}
+	if isNXDomain(&net.DNSError{Err: "timeout", Name: "x", IsTimeout: true}) {
+		t.Fatal("a timeout must not count as NXDOMAIN")
+	}
+	if isNXDomain(io.EOF) {
+		t.Fatal("unrelated errors must not count as NXDOMAIN")
+	}
+	if isNXDomain(nil) {
+		t.Fatal("nil must not count as NXDOMAIN")
+	}
+}
+
+func TestEvaluateTakeoverKeepsCNAMEWithoutFingerprintMatch(t *testing.T) {
+	tr := takeoverResult{CNAME: "shop.example.com."}
+	if tr.Vulnerable || tr.Provider != "" {
+		t.Fatalf("takeover=%v provider=%q, want no match", tr.Vulnerable, tr.Provider)
+	}
+	if tr.CNAME != "shop.example.com." {
+		t.Fatalf("cname = %q, want the resolved CNAME even without a match", tr.CNAME)
 	}
 }
 

@@ -290,7 +290,16 @@ palm subs.txt -takeover
 palm subs.txt -takeover -json
 ```
 
-`-takeover` checks CNAME targets and known provider error fingerprints. It performs an HTTP GET to the host even in `-mode dns`, because the provider's error page body is part of the fingerprint. `-json` records the resolved `cname` for every checked host, even when no fingerprint matches, so you can review dangling targets manually. Treat matches as takeover risk findings that should be manually verified before reporting.
+`-takeover` covers 37 services from the community list at [can-i-take-over-xyz](https://github.com/EdOverflow/can-i-take-over-xyz), keeping the entries still reported as vulnerable plus the edge cases that keep appearing in reports. Services marked "not vulnerable" there are deliberately left out because they only create false positives.
+
+A host is reported as a takeover in two ways:
+
+- **Dangling provider target**: the subdomain CNAMEs to a provider hostname that no longer resolves (a deleted S3 bucket, a removed Azure app, an expired Elastic Beanstalk environment). Anyone who can claim that name at the provider takes the host over. This is the strongest signal and needs no page fetch.
+- **Provider error page**: the CNAME points at a known provider and the response body is that provider's "this name is not taken" page.
+
+A dangling target at an unknown provider is reported separately as `dangling`: the CNAME target does not resolve, but the provider cannot hand out names, so it is a record to review rather than a takeover. Text output adds `dangling` and JSON sets `"dangling": true`. `-json` records the resolved `cname` for every checked host even when nothing matches. Treat every match as a risk finding that should be verified manually before reporting.
+
+Takeover mode performs one HTTP GET per live host, because some providers can only be recognised by their error page. Hosts whose HTTP phase already failed skip that request.
 
 Inspect TLS certificates:
 

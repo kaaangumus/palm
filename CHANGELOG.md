@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.4
+
+Takeover detection was too narrow: 10 fingerprints, and the list only ran when the CNAME already matched one of them, so a whole class of findings was invisible.
+
+- Fingerprints now cover 37 services from the community list at can-i-take-over-xyz, keeping the entries still reported as vulnerable plus the edge cases that keep appearing in reports. Services marked "not vulnerable" were dropped because they only produced false positives (Zendesk closed help centers, for example).
+- Added dangling-CNAME detection: when a subdomain points at a provider hostname that no longer resolves, it is reported as a takeover. Deleted buckets, removed Azure apps, and expired Elastic Beanstalk environments are all found this way, and it needs no page fetch.
+- Fixed the gate that made provider page fingerprints unreachable: services with no dedicated CNAME (Pantheon, Canny, DigitalOcean, GetResponse, Pingdom, Readthedocs, Short.io, Campaign Monitor, SmartJobBoard) are now checked by their error page instead of never being checked at all.
+- A CNAME target that does not resolve at an unlisted provider is reported as `dangling` rather than `takeover`, so dangling records can be reviewed without claiming a vulnerability.
+- Takeover mode skips the body fetch when the HTTP phase already failed, which makes it faster than before on dead hosts (about 16 s vs 19 s on a 900-host corpus).
+
 ## 0.6.3
 
 - The scheme in the output is deterministic again. HTTPS is used whenever it produced a usable response, instead of only when it answered within 250 ms of HTTP. Hosts whose TLS handshake was slower could flip between `https://` and `http://` from run to run (6 of 217 live hosts on a test corpus did). No speed change on the same corpus, and 17 more hosts are now correctly reported over HTTPS.

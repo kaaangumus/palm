@@ -31,7 +31,7 @@ import (
 	"time"
 )
 
-var version = "0.6.3"
+var version = "0.6.4"
 
 const modulePath = "github.com/kaaangumus/palm"
 const latestReleaseURL = "https://api.github.com/repos/kaaangumus/palm/releases/latest"
@@ -86,6 +86,7 @@ type result struct {
 	Takeover       bool     `json:"takeover,omitempty"`
 	Provider       string   `json:"takeover_provider,omitempty"`
 	CNAME          string   `json:"cname,omitempty"`
+	Dangling       bool     `json:"dangling,omitempty"`
 	Wildcard       bool     `json:"wildcard,omitempty"`
 	TLSIssuer      string   `json:"tls_issuer,omitempty"`
 	TLSExpires     string   `json:"tls_expires,omitempty"`
@@ -190,8 +191,27 @@ func (l *rateLimiter) Wait(ctx context.Context) error {
 
 type takeoverFingerprint struct {
 	Provider string
-	CNAMEs   []string
-	Bodies   []string
+	// CNAMEs are suffixes the provider hands out; a match means the name is
+	// hosted there and only then do the body fingerprints make sense.
+	CNAMEs []string
+	// Bodies matches when any entry appears in the response body.
+	Bodies []string
+	// BodyAll matches only when every entry appears, for providers whose error
+	// page is too generic to use a single phrase.
+	BodyAll []string
+	// NXDomain marks providers that can be claimed by anyone when the CNAME
+	// target stops resolving: a deleted bucket or app leaves a dangling name.
+	NXDomain bool
+}
+
+// takeoverResult separates what was proven from what is merely suspicious.
+type takeoverResult struct {
+	Vulnerable bool
+	Provider   string
+	CNAME      string
+	// Dangling is set when the CNAME target does not resolve. That is a real
+	// finding even for an unlisted provider, but it is not proof of takeover.
+	Dangling bool
 }
 
 type wildcardCache struct {
@@ -346,17 +366,59 @@ func ipSetsOverlap(a, b []string) bool {
 	return false
 }
 
+// takeoverFingerprints follows the community list at
+// github.com/EdOverflow/can-i-take-over-xyz, keeping the services still reported
+// as vulnerable plus the edge cases that keep showing up in reports. Entries
+// marked "not vulnerable" there are intentionally absent because they only
+// produce false positives (Zendesk closed help centers, for example).
+//
+// A fingerprint matches only together with its CNAME gate, except for providers
+// that hand out a shared hostname (or none at all) and can only be recognised by
+// their error page.
 var takeoverFingerprints = []takeoverFingerprint{
-	{Provider: "aws-s3", CNAMEs: []string{"s3.amazonaws.com", "s3-website", "amazonaws.com"}, Bodies: []string{"nosuchbucket", "the specified bucket does not exist"}},
+	{Provider: "aws-s3", CNAMEs: []string{"s3.amazonaws.com", "s3-website"}, Bodies: []string{"nosuchbucket", "the specified bucket does not exist"}},
+	{Provider: "aws-elasticbeanstalk", CNAMEs: []string{"elasticbeanstalk.com"}, NXDomain: true},
+	{Provider: "azure", CNAMEs: []string{
+		"cloudapp.net", "cloudapp.azure.com", "azurewebsites.net", "blob.core.windows.net",
+		"azure-api.net", "azurehdinsight.net", "azureedge.net", "azurecontainer.io",
+		"database.windows.net", "azuredatalakestore.net", "search.windows.net", "azurecr.io",
+		"redis.cache.windows.net", "servicebus.windows.net", "visualstudio.com", "trafficmanager.net",
+	}, NXDomain: true},
+	{Provider: "discourse", CNAMEs: []string{"trydiscourse.com"}, NXDomain: true},
 	{Provider: "github-pages", CNAMEs: []string{"github.io"}, Bodies: []string{"there isn't a github pages site here"}},
-	{Provider: "heroku", CNAMEs: []string{"herokuapp.com", "herokudns.com"}, Bodies: []string{"no such app", "heroku | no such app"}},
+	{Provider: "heroku", CNAMEs: []string{"herokuapp.com", "herokudns.com"}, Bodies: []string{"no such app"}},
 	{Provider: "netlify", CNAMEs: []string{"netlify.app", "netlifyglobalcdn.com"}, Bodies: []string{"not found - request id"}},
-	{Provider: "vercel", CNAMEs: []string{"vercel-dns.com", "vercel.app"}, Bodies: []string{"the deployment could not be found"}},
-	{Provider: "azure", CNAMEs: []string{"azurewebsites.net", "cloudapp.net", "trafficmanager.net"}, Bodies: []string{"404 web site not found"}},
-	{Provider: "fastly", CNAMEs: []string{"fastly.net"}, Bodies: []string{"fastly error: unknown domain"}},
+	{Provider: "vercel", CNAMEs: []string{"vercel-dns.com", "vercel.app"}, Bodies: []string{"deployment_not_found", "the deployment could not be found"}},
 	{Provider: "shopify", CNAMEs: []string{"myshopify.com"}, Bodies: []string{"sorry, this shop is currently unavailable"}},
-	{Provider: "zendesk", CNAMEs: []string{"zendesk.com"}, Bodies: []string{"help center closed", "oops, this help center no longer exists"}},
-	{Provider: "readme", CNAMEs: []string{"readme.io"}, Bodies: []string{"project doesnt exist", "project doesn't exist"}},
+	{Provider: "readme", CNAMEs: []string{"readme.io"}, Bodies: []string{"the creators of this project are still working on making everything perfect"}},
+	{Provider: "fastly", CNAMEs: []string{"fastly.net"}, Bodies: []string{"fastly error: unknown domain"}},
+	{Provider: "agilecrm", CNAMEs: []string{"agilecrm.com"}, Bodies: []string{"sorry, this page is no longer available"}},
+	{Provider: "anima", CNAMEs: []string{"animaapp.io"}, Bodies: []string{"the page you were looking for does not exist"}},
+	{Provider: "bitbucket", CNAMEs: []string{"bitbucket.io"}, Bodies: []string{"repository not found"}},
+	{Provider: "gemfury", CNAMEs: []string{"furyns.com"}, Bodies: []string{"404: this page could not be found"}},
+	{Provider: "ghost", CNAMEs: []string{"ghost.io"}, Bodies: []string{"site unavailable", "failed to resolve dns path for this host"}},
+	{Provider: "hatenablog", CNAMEs: []string{"hatenablog.com"}, Bodies: []string{"404 blog is not found"}},
+	{Provider: "helpjuice", CNAMEs: []string{"helpjuice.com"}, Bodies: []string{"we could not find what you're looking for"}},
+	{Provider: "helpscout", CNAMEs: []string{"helpscoutdocs.com"}, Bodies: []string{"no settings were found for this company"}},
+	{Provider: "jetbrains-youtrack", CNAMEs: []string{"youtrack.cloud"}, Bodies: []string{"is not a registered incloud youtrack"}},
+	{Provider: "ngrok", CNAMEs: []string{"ngrok.io", "ngrok-free.app"}, BodyAll: []string{"ngrok.io not found"}},
+	{Provider: "smartjobboard", Bodies: []string{"this job board website is either expired or its domain name is invalid"}},
+	{Provider: "strikingly", CNAMEs: []string{"s.strikinglydns.com"}, Bodies: []string{"page not found."}},
+	{Provider: "surge", CNAMEs: []string{"surge.sh", "na-west1.surge.sh"}, Bodies: []string{"project not found"}},
+	{Provider: "surveysparrow", CNAMEs: []string{"surveysparrow.com"}, Bodies: []string{"account not found."}},
+	{Provider: "uberflip", CNAMEs: []string{"read.uberflip.com"}, Bodies: []string{"the url you've accessed does not provide a hub"}},
+	{Provider: "uptimerobot", CNAMEs: []string{"stats.uptimerobot.com"}, Bodies: []string{"page not found"}},
+	{Provider: "wordpress", CNAMEs: []string{"wordpress.com"}, Bodies: []string{"do you want to register .wordpress.com"}},
+	{Provider: "worksites", CNAMEs: []string{"worksites.net"}, Bodies: []string{"the website you're looking for doesn't exist"}},
+	// Providers with no dedicated hostname: only the error page identifies them.
+	{Provider: "campaign-monitor", Bodies: []string{"trying to access your account?"}},
+	{Provider: "canny", Bodies: []string{"company not found", "there is no such company. did you enter the right url?"}},
+	{Provider: "digitalocean", Bodies: []string{"domain uses do name servers with no records in do"}},
+	{Provider: "getresponse", Bodies: []string{"with getresponse landing pages, lead generation has never been easier"}},
+	{Provider: "pantheon", Bodies: []string{"404 error unknown site!"}},
+	{Provider: "pingdom", Bodies: []string{"sorry, couldn't find the status page"}},
+	{Provider: "readthedocs", Bodies: []string{"the link you have followed or the url that you entered does not exist"}},
+	{Provider: "shortio", Bodies: []string{"link does not exist"}},
 }
 
 var (
@@ -1491,11 +1553,18 @@ func checkHost(ctx context.Context, host string, cfg config, client *http.Client
 	}
 
 	if cfg.takeover {
-		takeover, provider, cname := detectTakeover(ctx, host, cfg.timeout, resolvers, client, cfg.limiter)
-		res.CNAME = cname
-		res.Takeover = takeover
-		res.Provider = provider
-		if takeover {
+		// When the HTTP phase already failed, fetching the page again just
+		// repeats the same timeout; the DNS-based dangling check still runs.
+		fetchBody := true
+		if cfg.mode == "http" || cfg.mode == "both" {
+			fetchBody = res.Live
+		}
+		tr := detectTakeover(ctx, host, cfg.timeout, resolvers, client, cfg.limiter, fetchBody)
+		res.CNAME = tr.CNAME
+		res.Takeover = tr.Vulnerable
+		res.Provider = tr.Provider
+		res.Dangling = tr.Dangling
+		if tr.Vulnerable {
 			res.Live = true
 		}
 	}
@@ -1518,37 +1587,115 @@ func lookupHostWithCtx(ctx context.Context, host string, resolvers *resolverPool
 	return ips, nil
 }
 
-func detectTakeover(ctx context.Context, host string, timeout time.Duration, resolvers *resolverPool, client *http.Client, limiter *rateLimiter) (bool, string, string) {
+// detectTakeover resolves the CNAME chain, checks whether its target still
+// exists, and compares the served page against the provider fingerprints.
+func detectTakeover(ctx context.Context, host string, timeout time.Duration, resolvers *resolverPool, client *http.Client, limiter *rateLimiter, fetchBody bool) takeoverResult {
 	takeoverCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	cname, err := lookupCNAME(takeoverCtx, host, resolvers)
 	if err != nil || cname == "" {
-		return false, "", ""
+		return takeoverResult{}
 	}
-	return evaluateTakeover(takeoverCtx, host, cname, client, limiter)
+
+	out := takeoverResult{CNAME: cname, Dangling: cnameTargetMissing(takeoverCtx, host, cname, resolvers)}
+	return evaluateTakeover(takeoverCtx, host, out, client, limiter, fetchBody)
 }
 
-// evaluateTakeover keeps the resolved CNAME even when no takeover fingerprint
-// matches, so `-takeover -json` still shows the CNAME chain for manual review.
-func evaluateTakeover(ctx context.Context, host, cname string, client *http.Client, limiter *rateLimiter) (bool, string, string) {
-	fingerprint, ok := matchTakeoverCNAME(cname)
-	if !ok {
-		return false, "", cname
+// lookupHostForTakeover is a variable so the dangling-CNAME path can be tested
+// without real DNS.
+var lookupHostForTakeover = func(ctx context.Context, host string, resolvers *resolverPool) ([]string, error) {
+	return resolvers.lookupHost(ctx, host)
+}
+
+// cnameTargetMissing reports whether a CNAME target does not resolve. When the
+// target is gone, anyone who can claim that name at the provider takes over the
+// host, which is how deleted S3 buckets and removed Azure apps are found.
+func cnameTargetMissing(ctx context.Context, host, cname string, resolvers *resolverPool) bool {
+	target := strings.TrimSuffix(strings.ToLower(cname), ".")
+	if target == strings.ToLower(strings.TrimSuffix(host, ".")) {
+		return false // no CNAME record; the name resolves on its own
+	}
+	_, err := lookupHostForTakeover(ctx, target, resolvers)
+	return isNXDomain(err)
+}
+
+func isNXDomain(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return dnsErr.IsNotFound
+	}
+	return false
+}
+
+// evaluateTakeover keeps the resolved CNAME even when nothing matches, so
+// `-takeover -json` still shows the chain for manual review.
+func evaluateTakeover(ctx context.Context, host string, tr takeoverResult, client *http.Client, limiter *rateLimiter, fetchBody bool) takeoverResult {
+	fingerprint, cnameMatched := matchTakeoverCNAME(tr.CNAME)
+	if !fetchBody || !needsBodyCheck(fingerprint, cnameMatched) {
+		return decideTakeover(tr, cnameMatched, "")
+	}
+	body := fetchTakeoverBody(ctx, host, client, limiter)
+	return decideTakeover(tr, cnameMatched, body)
+}
+
+// decideTakeover is the pure part of the check: no network, so it can be tested
+// directly. body is empty when no page was fetched.
+func decideTakeover(tr takeoverResult, cnameMatched bool, body string) takeoverResult {
+	fingerprint, _ := matchTakeoverCNAME(tr.CNAME)
+
+	// Providers claimable by name: the CNAME target stopped resolving, so the
+	// name is free at the provider.
+	if cnameMatched && fingerprint.NXDomain && tr.Dangling {
+		tr.Vulnerable = true
+		tr.Provider = fingerprint.Provider
+		return tr
 	}
 
-	body := fetchTakeoverBody(ctx, host, client, limiter)
 	if body == "" {
-		return false, "", cname
+		return tr
 	}
-	if matchTakeoverBody(body, fingerprint) {
-		return true, fingerprint.Provider, cname
+	if cnameMatched && matchTakeoverBody(body, fingerprint) {
+		tr.Vulnerable = true
+		tr.Provider = fingerprint.Provider
+		return tr
 	}
-	return false, "", cname
+	// Providers that hand out a shared or no hostname can only be identified by
+	// their error page, so they are checked even without a CNAME match.
+	for _, candidate := range takeoverFingerprints {
+		if len(candidate.CNAMEs) > 0 {
+			continue
+		}
+		if matchTakeoverBody(body, candidate) {
+			tr.Vulnerable = true
+			tr.Provider = candidate.Provider
+			return tr
+		}
+	}
+	return tr
+}
+
+// needsBodyCheck avoids a page fetch when the only possible evidence was the
+// CNAME and it did not match.
+func needsBodyCheck(fp takeoverFingerprint, cnameMatched bool) bool {
+	if cnameMatched && (len(fp.Bodies) > 0 || len(fp.BodyAll) > 0) {
+		return true
+	}
+	for _, candidate := range takeoverFingerprints {
+		if len(candidate.CNAMEs) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// lookupCNAMEFunc is a variable so CNAME resolution can be stubbed in tests.
+var lookupCNAMEFunc = func(ctx context.Context, host string, resolvers *resolverPool) (string, error) {
+	return resolvers.lookupCNAME(ctx, host)
 }
 
 func lookupCNAME(ctx context.Context, host string, resolvers *resolverPool) (string, error) {
-	return resolvers.lookupCNAME(ctx, host)
+	return lookupCNAMEFunc(ctx, host, resolvers)
 }
 
 func matchTakeoverCNAME(cname string) (takeoverFingerprint, bool) {
@@ -1610,6 +1757,14 @@ func matchTakeoverBody(body string, fp takeoverFingerprint) bool {
 		if strings.Contains(body, strings.ToLower(pattern)) {
 			return true
 		}
+	}
+	if len(fp.BodyAll) > 0 {
+		for _, pattern := range fp.BodyAll {
+			if !strings.Contains(body, strings.ToLower(pattern)) {
+				return false
+			}
+		}
+		return true
 	}
 	return false
 }
@@ -2231,6 +2386,9 @@ func formatDNSResult(res result, cfg config) string {
 	if res.Takeover {
 		parts = append(parts, "takeover="+res.Provider)
 	}
+	if res.Dangling {
+		parts = append(parts, "dangling")
+	}
 	if res.CNAME != "" {
 		parts = append(parts, "cname="+res.CNAME)
 	}
@@ -2299,6 +2457,9 @@ func formatHTTPResult(res result, cfg config) string {
 	}
 	if res.Takeover {
 		parts = append(parts, "takeover="+res.Provider)
+	}
+	if res.Dangling {
+		parts = append(parts, "dangling")
 	}
 	if res.CNAME != "" {
 		parts = append(parts, "cname="+res.CNAME)
