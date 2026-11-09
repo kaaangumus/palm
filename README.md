@@ -441,6 +441,8 @@ With a cross-host redirect (default `-follow-redirects`), the probed subdomain s
 https://0b295af.sites.google.com [200 | final=https://accounts.google.com/ServiceLogin?...]
 ```
 
+A redirect that stays on the same host is not shown, so `https://host/` → `https://host/Security/Login` prints as a plain `https://host [200]` line. Use `-location -follow-redirects=false` when you want to see that path-level hop.
+
 `-title` only reports a title when the final page is served by the same site: the same hostname, or a `www.` ↔ apex redirect. A login page from another host is not attributed to the subdomain; follow `final=` instead.
 
 `-timeout` is a budget per phase: the DNS lookup gets one budget, and the HTTP phase shares one budget across the HTTPS and HTTP attempts, so a slow host cannot cost `2 x -timeout`.

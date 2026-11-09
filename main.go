@@ -31,7 +31,7 @@ import (
 	"time"
 )
 
-var version = "0.6.1"
+var version = "0.6.2"
 
 const modulePath = "github.com/kaaangumus/palm"
 const latestReleaseURL = "https://api.github.com/repos/kaaangumus/palm/releases/latest"
@@ -2128,6 +2128,10 @@ func indexFoldASCIIFrom(data []byte, needle string, from int) int {
 	return -1
 }
 
+// sameURL reports whether two URLs point at the same site for display purposes.
+// Only the host is compared: a redirect that stays on the same host (for example
+// / -> /Security/Login) is not interesting during triage and would add noise to
+// every line, so the probed URL stays the visible one.
 func sameURL(a, b string) bool {
 	ua, err := url.Parse(a)
 	if err != nil {
@@ -2137,10 +2141,7 @@ func sameURL(a, b string) bool {
 	if err != nil {
 		return a == b
 	}
-	if !strings.EqualFold(ua.Host, ub.Host) || ua.RawQuery != ub.RawQuery {
-		return false
-	}
-	return strings.TrimSuffix(ua.Path, "/") == strings.TrimSuffix(ub.Path, "/")
+	return strings.EqualFold(strings.TrimSuffix(ua.Hostname(), "."), strings.TrimSuffix(ub.Hostname(), "."))
 }
 
 func shortErr(err error) string {

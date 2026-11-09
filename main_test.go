@@ -441,7 +441,7 @@ func TestStripScheme(t *testing.T) {
 func TestNoSchemeTextOutput(t *testing.T) {
 	results := []result{
 		{Host: "a.example.com", Live: true, ProbedURL: "https://a.example.com", StatusCode: 200},
-		{Host: "b.example.com", Live: true, ProbedURL: "https://b.example.com", URL: "https://b.example.com/login", StatusCode: 200},
+		{Host: "b.example.com", Live: true, ProbedURL: "https://b.example.com", URL: "https://login.example.net/sso", StatusCode: 302},
 	}
 
 	var out bytes.Buffer
@@ -455,7 +455,7 @@ func TestNoSchemeTextOutput(t *testing.T) {
 	if !strings.Contains(got, "a.example.com [200]") {
 		t.Fatalf("missing stripped host line:\n%s", got)
 	}
-	if !strings.Contains(got, "final=b.example.com/login") {
+	if !strings.Contains(got, "final=login.example.net/sso") {
 		t.Fatalf("final= should be stripped too:\n%s", got)
 	}
 }
@@ -737,8 +737,15 @@ func TestFormatHTTPResultShowsProbedHostForCrossHostRedirect(t *testing.T) {
 	}
 }
 
-func TestFormatHTTPResultHidesSameURLRedirect(t *testing.T) {
-	for _, final := range []string{"https://example.com", "https://example.com/", "https://EXAMPLE.com/"} {
+func TestFormatHTTPResultHidesSameHostRedirect(t *testing.T) {
+	tests := []string{
+		"https://example.com",
+		"https://example.com/",
+		"https://EXAMPLE.com/",
+		"https://example.com/Security/Login",
+		"https://example.com/login?next=/x",
+	}
+	for _, final := range tests {
 		got := formatHTTPResult(result{
 			ProbedURL:  "https://example.com",
 			URL:        final,
@@ -747,6 +754,18 @@ func TestFormatHTTPResultHidesSameURLRedirect(t *testing.T) {
 		if got != "https://example.com [200]" {
 			t.Fatalf("final %q: got %q, want no final= noise", final, got)
 		}
+	}
+}
+
+func TestFormatHTTPResultShowsCrossHostRedirect(t *testing.T) {
+	got := formatHTTPResult(result{
+		ProbedURL:  "https://www.example.com",
+		URL:        "https://login.example.net/sso",
+		StatusCode: 302,
+	}, config{status: true})
+	want := "https://www.example.com [302 | final=https://login.example.net/sso]"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 

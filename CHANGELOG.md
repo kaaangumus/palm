@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.2
+
+- `final=` now appears only when a redirect changes the host. A same-host redirect such as `https://host/` to `https://host/Security/Login` prints as a plain `https://host [200]` line, which keeps triage output short. `-location -follow-redirects=false` still shows the raw hop.
+
 ## 0.6.1
 
 - Added `-no-scheme`: text output (`-q` included, and `final=`) drops the `http://` / `https://` prefix. JSON keeps full URLs.
