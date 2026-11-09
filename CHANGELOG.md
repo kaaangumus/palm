@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.3
+
+- The scheme in the output is deterministic again. HTTPS is used whenever it produced a usable response, instead of only when it answered within 250 ms of HTTP. Hosts whose TLS handshake was slower could flip between `https://` and `http://` from run to run (6 of 217 live hosts on a test corpus did). No speed change on the same corpus, and 17 more hosts are now correctly reported over HTTPS.
+
 ## 0.6.2
 
 - `final=` now appears only when a redirect changes the host. A same-host redirect such as `https://host/` to `https://host/Security/Login` prints as a plain `https://host [200]` line, which keeps triage output short. `-location -follow-redirects=false` still shows the raw hop.

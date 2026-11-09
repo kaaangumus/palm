@@ -157,7 +157,7 @@ func TestRequestURLFallsBackToGetWhenHeadFails(t *testing.T) {
 	}
 }
 
-func TestCheckHTTPDoesNotWaitForBlackholedTLS(t *testing.T) {
+func TestCheckHTTPFallsBackToHTTPWhenTLSHangs(t *testing.T) {
 	// A listener that accepts and never answers simulates a host that drops 443.
 	blackhole, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -216,8 +216,10 @@ func TestCheckHTTPDoesNotWaitForBlackholedTLS(t *testing.T) {
 	if probe.URL != "http://example.test" {
 		t.Fatalf("probe URL = %q, want the HTTP attempt", probe.URL)
 	}
-	if elapsed > time.Second {
-		t.Fatalf("took %v; a blackholed 443 must not delay the HTTP result", elapsed)
+	// A blackholed 443 waits for the HTTPS outcome so the scheme choice stays
+	// deterministic, but it must never exceed the single phase budget.
+	if elapsed > 2*time.Second+300*time.Millisecond {
+		t.Fatalf("took %v, want at most one -timeout budget", elapsed)
 	}
 }
 
@@ -226,6 +228,7 @@ func TestCheckHTTPPrefersHTTPS(t *testing.T) {
 		_, _ = w.Write([]byte("secure"))
 	}))
 	defer tlsSrv.Close()
+
 	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("plain"))
 	}))
@@ -252,6 +255,48 @@ func TestCheckHTTPPrefersHTTPS(t *testing.T) {
 	}
 	if probe.URL != "https://example.test" {
 		t.Fatalf("probe URL = %q, want the HTTPS attempt to win", probe.URL)
+	}
+}
+
+// A slow but working HTTPS must still beat a fast HTTP answer. The old
+// implementation returned HTTP after a 250ms grace, so the reported scheme
+// changed between runs for hosts whose TLS handshake took longer than that.
+func TestCheckHTTPPrefersSlowHTTPSOverFastHTTP(t *testing.T) {
+	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(400 * time.Millisecond)
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer tlsSrv.Close()
+
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMovedPermanently)
+	}))
+	defer httpSrv.Close()
+
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				var d net.Dialer
+				_, port, _ := net.SplitHostPort(addr)
+				if port == "443" {
+					return d.DialContext(ctx, network, tlsSrv.Listener.Addr().String())
+				}
+				return d.DialContext(ctx, network, httpSrv.Listener.Addr().String())
+			},
+		},
+	}
+
+	probe, err := checkHTTP(context.Background(), "example.test", config{timeout: 3 * time.Second}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe.URL != "https://example.test" {
+		t.Fatalf("probe URL = %q, want HTTPS to win even though HTTP answered first", probe.URL)
+	}
+	if probe.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want the HTTPS status 403", probe.StatusCode)
 	}
 }
 

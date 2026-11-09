@@ -31,7 +31,7 @@ import (
 	"time"
 )
 
-var version = "0.6.2"
+var version = "0.6.3"
 
 const modulePath = "github.com/kaaangumus/palm"
 const latestReleaseURL = "https://api.github.com/repos/kaaangumus/palm/releases/latest"
@@ -1741,11 +1741,6 @@ func (p *resolverPool) dialContext(timeout time.Duration) func(ctx context.Conte
 	}
 }
 
-// schemePreferenceGrace is how long an HTTP result waits for a still-pending
-// HTTPS attempt before it is returned. It keeps HTTPS preferred without paying
-// a full timeout for HTTP-only hosts.
-const schemePreferenceGrace = 250 * time.Millisecond
-
 func checkHTTP(ctx context.Context, host string, cfg config, client *http.Client) (httpProbe, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1756,6 +1751,11 @@ func checkHTTP(ctx context.Context, host string, cfg config, client *http.Client
 		scheme string
 	}
 
+	// Both schemes are probed at once under one budget, so a host that drops
+	// port 443 still gets its HTTP chance. The winner is decided by preference,
+	// never by which answer arrived first: HTTPS is used whenever it produced a
+	// usable response, otherwise HTTP. A timer-based shortcut here made the
+	// reported scheme differ between runs for the same host.
 	ch := make(chan outcome, 2)
 	for _, scheme := range []string{"https", "http"} {
 		scheme := scheme
@@ -1767,27 +1767,17 @@ func checkHTTP(ctx context.Context, host string, cfg config, client *http.Client
 
 	var httpOK *outcome
 	var lastErr error
-	var grace <-chan time.Time
 	for i := 0; i < 2; i++ {
-		var out outcome
-		if grace != nil {
-			select {
-			case out = <-ch:
-			case <-grace:
-				// HTTP already answered and HTTPS is still not done.
-				return httpOK.probe, nil
-			}
-		} else {
-			out = <-ch
-		}
+		out := <-ch
 
 		if out.err == nil && statusAllowed(out.probe.StatusCode, cfg) {
 			if out.scheme == "https" {
+				// Returning cancels the HTTP attempt through the deferred cancel.
 				return out.probe, nil
 			}
 			httpCopy := out
 			httpOK = &httpCopy
-			grace = time.After(schemePreferenceGrace)
+			// Keep waiting for the HTTPS outcome to make the choice deterministic.
 			continue
 		}
 

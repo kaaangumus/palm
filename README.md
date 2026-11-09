@@ -360,7 +360,7 @@ palm -lang en -h
 Each host is probed once, but palm does not wait for HTTPS before trying HTTP:
 
 - Both `https://` and `http://` are probed in parallel under one `-timeout` budget, so a host that blackholes port 443 still gets its HTTP chance, and a host that only answers over HTTP is found in one timeout instead of two.
-- HTTPS is still preferred: when both answer, the HTTPS result wins after a short grace window.
+- HTTPS is always preferred: when both answer, the HTTPS result wins. The choice never depends on which scheme answered first, so the same host reports the same scheme on every run.
 - HTTP/2 stays enabled even though certificate verification is skipped, so h2 sites only need one connection.
 - A failed `HEAD` (a server that hangs up or resets) is retried once with `GET`, which recovers sites that reject HEAD.
 - `-title` stops reading as soon as `</title>` is seen instead of downloading the whole capped body.
