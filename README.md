@@ -320,6 +320,15 @@ Stream results as they arrive instead of waiting for the whole scan:
 palm subs.txt -no-sort -q
 ```
 
+Drop the URL scheme when you want bare hosts:
+
+```bash
+palm subs.txt -q -no-scheme        # api.example.com
+palm subs.txt -status -no-scheme   # api.example.com [200 | ip=...]
+```
+
+`-no-scheme` affects text output only; JSON keeps full URLs so parsers still see the scheme.
+
 The default still sorts by host name. `-no-sort` writes each result the moment it finishes, so a long scan starts printing immediately and memory stays flat. Filters, `-q`, `-json`, and the atomic output file behave the same either way.
 
 Show progress on stderr while scanning:
@@ -389,6 +398,7 @@ Only scan domains and infrastructure you own or have permission to test. `palm` 
 -fw                drop hosts that match a wildcard DNS record
 -q                 only print live URLs, bare and pipe-friendly
 -no-sort           print in completion order instead of host order
+-no-scheme         omit the http:// or https:// prefix in text output
 -progress          print progress to stderr
 -rate float        max HTTP requests per second (0 = unlimited)
 -delay duration    minimum delay between HTTP requests, e.g. 200ms

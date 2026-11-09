@@ -31,7 +31,7 @@ import (
 	"time"
 )
 
-var version = "0.6.0"
+var version = "0.6.1"
 
 const modulePath = "github.com/kaaangumus/palm"
 const latestReleaseURL = "https://api.github.com/repos/kaaangumus/palm/releases/latest"
@@ -63,6 +63,7 @@ type config struct {
 	delay           time.Duration
 	limiter         *rateLimiter
 	noSort          bool
+	noScheme        bool
 	progress        bool
 	progressOut     io.Writer
 	matchCodes      map[int]struct{}
@@ -472,6 +473,7 @@ func parseFlags(args []string) (config, error) {
 	fs.Float64Var(&cfg.rate, "rate", 0, "max HTTP requests per second (0 = unlimited)")
 	fs.DurationVar(&cfg.delay, "delay", 0, "minimum delay between HTTP requests, e.g. 200ms")
 	fs.BoolVar(&cfg.noSort, "no-sort", false, "print results in completion order instead of host order")
+	fs.BoolVar(&cfg.noScheme, "no-scheme", false, "omit the http:// or https:// prefix in text output")
 	fs.BoolVar(&cfg.progress, "progress", false, "print progress to stderr")
 	showHelp := fs.Bool("h", false, "show help")
 	fs.BoolVar(showHelp, "help", false, "show help")
@@ -1008,6 +1010,7 @@ Flags:
   -fw                drop hosts that match a wildcard DNS record
   -q                 only print live URLs, bare and pipe-friendly
   -no-sort           print in completion order instead of host order
+  -no-scheme         omit the http:// or https:// prefix in text output
   -progress          print progress to stderr
   -rate float        max HTTP requests per second (0 = unlimited)
   -delay duration    minimum delay between HTTP requests, e.g. 200ms
@@ -1056,6 +1059,7 @@ Parametreler:
   -fw                wildcard DNS kaydiyla eslesen hostlari ele
   -q                 sadece live URL yaz, sade ve pipe dostu
   -no-sort           host sirasi yerine tamamlanma sirasina gore yaz
+  -no-scheme         text ciktida http:// veya https:// onekini kaldir
   -progress          stderr'e ilerleme yaz
   -rate float        saniyedeki en fazla HTTP istegi (0 = sinirsiz)
   -delay duration    HTTP istekleri arasi en az bekleme, orn. 200ms
@@ -2174,7 +2178,11 @@ func writeResult(w io.Writer, res result, cfg config) error {
 	}
 
 	if cfg.quiet {
-		_, err := fmt.Fprintln(w, resultURL(res))
+		value := resultURL(res)
+		if cfg.noScheme {
+			value = stripScheme(value)
+		}
+		_, err := fmt.Fprintln(w, value)
 		return err
 	}
 
@@ -2208,6 +2216,18 @@ func resultURL(res result) string {
 	return res.Host
 }
 
+// stripScheme removes a leading http:// or https:// so text output can match the
+// bare host form that other recon tools emit.
+func stripScheme(value string) string {
+	if rest, ok := strings.CutPrefix(value, "https://"); ok {
+		return rest
+	}
+	if rest, ok := strings.CutPrefix(value, "http://"); ok {
+		return rest
+	}
+	return value
+}
+
 func formatDNSResult(res result, cfg config) string {
 	value := res.Host
 	var parts []string
@@ -2237,6 +2257,9 @@ func formatHTTPResult(res result, cfg config) string {
 	if value == "" {
 		value = res.Host
 	}
+	if cfg.noScheme {
+		value = stripScheme(value)
+	}
 	var parts []string
 	if cfg.status && res.StatusCode > 0 {
 		parts = append(parts, strconv.Itoa(res.StatusCode))
@@ -2245,7 +2268,11 @@ func formatHTTPResult(res result, cfg config) string {
 		parts = append(parts, "ip="+strings.Join(res.IPs, ","))
 	}
 	if res.URL != "" && res.ProbedURL != "" && !sameURL(res.ProbedURL, res.URL) {
-		parts = append(parts, "final="+res.URL)
+		final := res.URL
+		if cfg.noScheme {
+			final = stripScheme(final)
+		}
+		parts = append(parts, "final="+final)
 	}
 	if cfg.title && res.Title != "" {
 		parts = append(parts, "title="+res.Title)

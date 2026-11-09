@@ -423,6 +423,65 @@ func TestUpdatePalmNoopWhenCurrent(t *testing.T) {
 	}
 }
 
+func TestStripScheme(t *testing.T) {
+	tests := map[string]string{
+		"https://api.example.com":     "api.example.com",
+		"http://dev.example.com/path": "dev.example.com/path",
+		"api.example.com":             "api.example.com",
+		"HTTPS://api.example.com":     "HTTPS://api.example.com", // prefix match is case-sensitive
+		"":                            "",
+	}
+	for input, want := range tests {
+		if got := stripScheme(input); got != want {
+			t.Errorf("stripScheme(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestNoSchemeTextOutput(t *testing.T) {
+	results := []result{
+		{Host: "a.example.com", Live: true, ProbedURL: "https://a.example.com", StatusCode: 200},
+		{Host: "b.example.com", Live: true, ProbedURL: "https://b.example.com", URL: "https://b.example.com/login", StatusCode: 200},
+	}
+
+	var out bytes.Buffer
+	if err := writeResults(&out, results, config{status: true, noScheme: true, mode: "http"}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if strings.Contains(got, "http://") || strings.Contains(got, "https://") {
+		t.Fatalf("output still has a scheme:\n%s", got)
+	}
+	if !strings.Contains(got, "a.example.com [200]") {
+		t.Fatalf("missing stripped host line:\n%s", got)
+	}
+	if !strings.Contains(got, "final=b.example.com/login") {
+		t.Fatalf("final= should be stripped too:\n%s", got)
+	}
+}
+
+func TestNoSchemeQuietOutput(t *testing.T) {
+	results := []result{{Host: "a.example.com", Live: true, ProbedURL: "http://a.example.com"}}
+	var out bytes.Buffer
+	if err := writeResults(&out, results, config{quiet: true, noScheme: true, mode: "http"}); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "a.example.com\n" {
+		t.Fatalf("quiet no-scheme output = %q, want %q", out.String(), "a.example.com\n")
+	}
+}
+
+func TestNoSchemeKeepsJSONUrls(t *testing.T) {
+	results := []result{{Host: "a.example.com", Live: true, ProbedURL: "https://a.example.com"}}
+	var out bytes.Buffer
+	if err := writeResults(&out, results, config{jsonOut: true, noScheme: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"probed_url":"https://a.example.com"`) {
+		t.Fatalf("JSON url should keep its scheme: %s", out.String())
+	}
+}
+
 func TestParseFlagsDefaultsToBothMode(t *testing.T) {
 	cfg, err := parseFlags([]string{})
 	if err != nil {

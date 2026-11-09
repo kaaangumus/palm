@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.6.1
+
+- Added `-no-scheme`: text output (`-q` included, and `final=`) drops the `http://` / `https://` prefix. JSON keeps full URLs.
+- Fixed the 0.6.0 changelog heading: the entries below belonged to 0.6.0.
+
+## 0.6.0
 
 Self-update:
 
