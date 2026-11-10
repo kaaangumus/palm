@@ -823,6 +823,128 @@ func TestFormatExtensionAndAutoSaveName(t *testing.T) {
 	}
 }
 
+func TestFormatFromExtension(t *testing.T) {
+	tests := map[string]string{
+		"out.html":    formatHTML,
+		"out.HTM":     formatHTML,
+		"results.xml": formatXML,
+		"data.json":   formatJSON,
+		"data.jsonl":  formatJSONL,
+		"data.ndjson": formatJSONL,
+		"hosts.txt":   formatText,
+		"noextension": "",
+		"weird.data":  "",
+	}
+	for path, want := range tests {
+		if got := formatFromExtension(path); got != want {
+			t.Errorf("formatFromExtension(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
+
+func TestParseFlagsInfersFormatFromOutputExtension(t *testing.T) {
+	tests := map[string]string{
+		"report.html": formatHTML,
+		"results.xml": formatXML,
+		"data.json":   formatJSON,
+		"data.jsonl":  formatJSONL,
+		"hosts.txt":   formatText,
+	}
+	for out, want := range tests {
+		cfg, err := parseFlags([]string{"-o", out})
+		if err != nil {
+			t.Fatalf("%s: %v", out, err)
+		}
+		if cfg.format != want {
+			t.Errorf("-o %s gave format %q, want %q", out, cfg.format, want)
+		}
+	}
+
+	// An explicit -format beats the extension.
+	cfg, err := parseFlags([]string{"-o", "report.html", "-format", "text"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.format != formatText {
+		t.Fatalf("explicit -format text overrode by extension: got %q", cfg.format)
+	}
+
+	// No -o keeps the default.
+	cfg, err = parseFlags(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.format != formatText {
+		t.Fatalf("default format = %q, want text", cfg.format)
+	}
+}
+
+func TestRenderConvertsJSONL(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "in.jsonl")
+	lines := `{"host":"a.example.com","live":true,"probed_url":"https://a.example.com","status_code":200}
+{"host":"b.example.com","live":false,"error":"no such host"}
+`
+	if err := os.WriteFile(src, []byte(lines), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := renderResults(config{renderFile: src, format: formatXML}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "<results>") {
+		t.Fatalf("render did not produce XML:\n%s", out.String())
+	}
+	if strings.Count(out.String(), "<result>") != 2 {
+		t.Fatalf("render lost records:\n%s", out.String())
+	}
+
+	// Text rendering keeps only live hosts.
+	out.Reset()
+	if err := renderResults(config{renderFile: src, format: formatText}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "b.example.com") {
+		t.Fatalf("text render included a dead host:\n%s", out.String())
+	}
+}
+
+func TestRenderRejectsBadJSONL(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "bad.jsonl")
+	if err := os.WriteFile(src, []byte("not json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := renderResults(config{renderFile: src, format: formatJSON}, io.Discard)
+	if err == nil {
+		t.Fatal("renderResults accepted invalid JSONL")
+	}
+	if !strings.Contains(err.Error(), "line 1") {
+		t.Fatalf("error should name the line: %v", err)
+	}
+}
+
+func TestRenderWritesOutputFile(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "in.jsonl")
+	if err := os.WriteFile(src, []byte(`{"host":"a.example.com","live":true}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "out.html")
+
+	if err := renderResults(config{renderFile: src, format: formatHTML, outputFile: dst}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "<!DOCTYPE html>") {
+		t.Fatalf("output file is not HTML:\n%s", data)
+	}
+}
+
 func TestParseFlagsDefaultsToBothMode(t *testing.T) {
 	cfg, err := parseFlags([]string{})
 	if err != nil {

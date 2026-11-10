@@ -32,7 +32,7 @@ import (
 	"time"
 )
 
-var version = "0.7.0"
+var version = "0.7.1"
 
 const modulePath = "github.com/kaaangumus/palm"
 const latestReleaseURL = "https://api.github.com/repos/kaaangumus/palm/releases/latest"
@@ -82,6 +82,8 @@ type config struct {
 	autoSave  bool
 	saveDir   string
 	savedPath string
+	// renderFile converts an existing JSONL result file instead of scanning.
+	renderFile string
 }
 
 // Output formats accepted by -format.
@@ -609,6 +611,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return nil
 	}
 
+	// -render converts a saved JSONL file: no scanning, no network.
+	if cfg.renderFile != "" {
+		return renderResults(cfg, stdout)
+	}
+
 	hosts, err := readHosts(cfg.inputFile, stdin)
 	if err != nil {
 		return err
@@ -698,6 +705,55 @@ var stdoutIsTerminal = func(w io.Writer) bool {
 
 // openAutoSave creates <save-dir>/<host>-<timestamp>.<ext> and returns the file
 // so results can be written to it and the terminal at the same time.
+// renderResults re-emits a saved JSONL file in the requested -format. It lets a
+// scan be turned into an HTML/XML/JSON report later without scanning again.
+func renderResults(cfg config, stdout io.Writer) error {
+	in, err := os.Open(cfg.renderFile)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := openResultWriter(cfg.outputFile, stdout)
+	if err != nil {
+		return err
+	}
+	defer out.Abort()
+
+	em := newEmitter(cfg)
+	if err := em.Begin(out); err != nil {
+		return err
+	}
+
+	scanner := bufio.NewScanner(in)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	line := 0
+	for scanner.Scan() {
+		line++
+		raw := strings.TrimSpace(scanner.Text())
+		if raw == "" {
+			continue
+		}
+		var res result
+		if err := json.Unmarshal([]byte(raw), &res); err != nil {
+			return fmt.Errorf("%s line %d: %w", cfg.renderFile, line, err)
+		}
+		if err := em.Emit(out, res); err != nil {
+			return err
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	if err := em.End(out); err != nil {
+		return err
+	}
+	if err := out.Commit(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func openAutoSave(cfg config, firstHost string) (*os.File, string, error) {
 	dir := cfg.saveDir
 	if dir == "" {
@@ -733,6 +789,25 @@ func formatExtension(format string) string {
 		return "html"
 	}
 	return "txt"
+}
+
+// formatFromExtension maps an output filename to a format, so "-o report.html"
+// or "-o results.xml" does the expected thing without an extra flag. An unknown
+// extension returns "" and leaves the default (text) in place.
+func formatFromExtension(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".jsonl", ".ndjson":
+		return formatJSONL
+	case ".json":
+		return formatJSON
+	case ".xml":
+		return formatXML
+	case ".html", ".htm":
+		return formatHTML
+	case ".txt":
+		return formatText
+	}
+	return ""
 }
 func parseFlags(args []string) (config, error) {
 	var cfg config
@@ -775,6 +850,7 @@ func parseFlags(args []string) (config, error) {
 	fs.BoolVar(&cfg.noSort, "no-sort", false, "print results in completion order instead of host order")
 	fs.BoolVar(&cfg.noScheme, "no-scheme", false, "omit the http:// or https:// prefix in text output")
 	fs.BoolVar(&cfg.progress, "progress", false, "print progress to stderr")
+	render := fs.String("render", "", "convert an existing palm JSONL file to -format instead of scanning")
 	showHelp := fs.Bool("h", false, "show help")
 	fs.BoolVar(showHelp, "help", false, "show help")
 	showVersion := fs.Bool("version", false, "show version")
@@ -786,6 +862,14 @@ func parseFlags(args []string) (config, error) {
 	if err := fs.Parse(reorderArgs(args)); err != nil {
 		return cfg, usageError(*lang)
 	}
+	// Record whether -format was typed: a flag left at its default must not
+	// override an -o extension.
+	formatExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "format" {
+			formatExplicit = true
+		}
+	})
 	cfg.lang = strings.ToLower(strings.TrimSpace(*lang))
 	switch cfg.lang {
 	case "", "en", "tr":
@@ -820,11 +904,20 @@ func parseFlags(args []string) (config, error) {
 		fmt.Fprint(os.Stdout, miamiEgg())
 		os.Exit(0)
 	}
+	cfg.renderFile = strings.TrimSpace(*render)
 	if cfg.inputFile == "" && fs.NArg() > 0 {
 		cfg.inputFile = fs.Arg(0)
 	}
 	if fs.NArg() > 1 {
 		return cfg, errors.New("only one input file can be provided")
+	}
+
+	// A named -format always wins. Otherwise the output extension decides, so
+	// "-o report.html" produces HTML instead of a text file with an .html name.
+	if !formatExplicit && cfg.outputFile != "" {
+		if inferred := formatFromExtension(cfg.outputFile); inferred != "" {
+			cfg.format = inferred
+		}
 	}
 	if cfg.concurrency < 1 {
 		return cfg, errors.New("concurrency must be greater than 0")
@@ -867,7 +960,16 @@ func parseFlags(args []string) (config, error) {
 		return cfg, errors.New("-wildcard and -fw require -mode dns or both")
 	}
 
-	cfg.format = strings.ToLower(strings.TrimSpace(*format))
+	// Only read the flag value back when the user typed -format; otherwise the
+	// extension-based choice from earlier would be thrown away here.
+	if formatExplicit {
+		cfg.format = strings.ToLower(strings.TrimSpace(*format))
+	} else {
+		cfg.format = strings.ToLower(strings.TrimSpace(cfg.format))
+		if cfg.format == "" {
+			cfg.format = formatText
+		}
+	}
 	if cfg.jsonOut {
 		// -json has always meant JSON lines; -format is the explicit form.
 		if cfg.format == formatText || cfg.format == formatJSONL {
@@ -897,7 +999,7 @@ func parseFlags(args []string) (config, error) {
 func reorderArgs(args []string) []string {
 	valueFlags := map[string]struct{}{
 		"-l": {}, "-list": {}, "-o": {}, "-mode": {}, "-r": {}, "-c": {}, "-timeout": {}, "-mc": {}, "-fc": {}, "-method": {}, "-H": {}, "-lang": {},
-		"-rate": {}, "-delay": {}, "-format": {}, "-print": {}, "-save-dir": {},
+		"-rate": {}, "-delay": {}, "-format": {}, "-print": {}, "-save-dir": {}, "-render": {},
 	}
 
 	var flags []string
@@ -1336,6 +1438,7 @@ Flags:
   -q                 only print live URLs, bare and pipe-friendly
   -print string      leading text value: host, url, auto (default "auto")
   -format string     output format: text, jsonl, json, xml, html (default "text")
+  -render string     convert an existing JSONL file to -format (no scan)
   -waf               detect the WAF or CDN in front of each host
   -save              write a timestamped copy when output goes to a terminal (default true)
   -save-dir string   directory for -save (default "palm-results")
@@ -1390,6 +1493,7 @@ Parametreler:
   -q                 sadece live URL yaz, sade ve pipe dostu
   -print string      satir basindaki deger: host, url, auto (varsayilan "auto")
   -format string     cikti formati: text, jsonl, json, xml, html (varsayilan "text")
+  -render string     var olan JSONL dosyasini -format'a cevir (tarama yok)
   -waf               her hostun onundeki WAF/CDN'i tespit et
   -save              terminale yazarken zaman damgali kopya kaydet (varsayilan true)
   -save-dir string   -save icin klasor (varsayilan "palm-results")

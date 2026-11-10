@@ -41,6 +41,8 @@ RUN_NUCLEI=0
 RUN_TAKEOVER=1
 RUN_AMASS=0
 RUN_REPORT=1
+# Which formats to render from live.jsonl at the end of a run.
+EXPORT_FORMATS="html"
 NUCLEI_TEMPLATES="${NUCLEI_TEMPLATES:-}"
 NUCLEI_SEVERITY="${NUCLEI_SEVERITY:-critical,high,medium}"
 FORCE=0
@@ -70,6 +72,9 @@ Options:
       --with-amass        also run amass (slow: many sources, often minutes)
       --with-nuclei       add the nuclei template scan (slow)
       --no-report         skip the HTML report at the end
+      --export <list>     formats to render from the results: json, xml, html
+                          (comma or space separated; default: html)
+                          example: --export json,xml,html
       --nuclei-severity <list>
                           nuclei severities (default: critical,high,medium)
       --nuclei-templates <dir>
@@ -93,7 +98,9 @@ Output layout:
   <out>/waf.txt         WAF per host
   <out>/nuclei.txt      nuclei findings (only with --with-nuclei)
   <out>/summary.txt     human readable report
-  <out>/report.html    shareable HTML report (needs python3)
+  <out>/report.html    shareable HTML report (see --export)
+  <out>/results.json   full JSON array when --export json is given
+  <out>/results.xml    XML report when --export xml is given
 
 Only scan assets you own or are authorised to test.
 EOF
@@ -141,7 +148,8 @@ while [ $# -gt 0 ]; do
     --no-takeover)    RUN_TAKEOVER=0; shift ;;
     --with-amass)     RUN_AMASS=1; shift ;;
     --with-nuclei)    RUN_NUCLEI=1; shift ;;
-    --no-report)      RUN_REPORT=0; shift ;;
+    --no-report)      RUN_REPORT=0; EXPORT_FORMATS=""; shift ;;
+    --export)         EXPORT_FORMATS="$(printf '%s' "${2:-}" | tr ',' ' ')"; shift 2 ;;
     --nuclei-severity) NUCLEI_SEVERITY="${2:-}"; shift 2 ;;
     --nuclei-templates) NUCLEI_TEMPLATES="${2:-}"; shift 2 ;;
     --force)          FORCE=1; shift ;;
@@ -600,14 +608,32 @@ log "writing summary"
 
 elapsed=$(( $(date +%s) - start ))
 
-# Shareable report, built from the JSON palm already produced.
-if [ "$RUN_REPORT" -eq 1 ] && [ -s "$LIVE_JSON" ]; then
-  log "writing HTML report"
-  if write_html_report "$LIVE_JSON" "$REPORT_OUT" "$DOMAIN"; then
-    ok "report: $REPORT_OUT"
-  else
-    warn "report: python3 missing, HTML report skipped"
-  fi
+# Exports are rendered from the JSON palm already produced, so no re-scan.
+# palm -render keeps this free of any python dependency.
+if [ -s "$LIVE_JSON" ]; then
+  for fmt in $EXPORT_FORMATS; do
+    case "$fmt" in
+      html) out="$REPORT_OUT" ;;
+      *)    out="$OUTDIR/results.$fmt" ;;
+    esac
+
+    if palm_supports -render; then
+      if "$PALM_BIN" -render "$LIVE_JSON" -format "$fmt" -o "$out" 2>/dev/null; then
+        ok "export: $out"
+        continue
+      fi
+      warn "export $fmt: palm -render failed"
+    fi
+
+    # Older palm: HTML can still be produced by the python fallback.
+    if [ "$fmt" = "html" ] && [ "$RUN_REPORT" -eq 1 ]; then
+      if write_html_report "$LIVE_JSON" "$out" "$DOMAIN"; then
+        ok "report: $out"
+        continue
+      fi
+    fi
+    warn "export $fmt: skipped (needs palm 0.7.1 or newer, or python3 for html)"
+  done
 fi
 
 # Scratch space is only needed while the stages run; keep the output folder tidy.

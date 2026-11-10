@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.1
+
+- `-o` now picks the format from its extension when `-format` is not given, so
+  `-o report.html` writes HTML instead of a text file named `.html`. An explicit
+  `-format` still wins.
+- Added `-render <file>`: converts a saved palm JSONL result into text, JSON,
+  XML or HTML without scanning again.
+- `recon.sh --export json,xml,html` writes `results.json`, `results.xml` and
+  `report.html` from `live.jsonl` using `palm -render`, so the HTML report no
+  longer depends on python3.
+- `recon.sh` only passes `-waf`/`-render` when the installed palm supports them,
+  so an older palm degrades instead of failing a stage.
+- `recon-tui.sh` gained an EXPORT option, a "produce report" action for past
+  runs, and a `PALM_BIN` setting shared with recon.sh.
+
 ## 0.7.0
 
 Output clarity, WAF checks and export formats:

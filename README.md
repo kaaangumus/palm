@@ -378,6 +378,27 @@ the file explains what was checked. `text` and `jsonl` stay one-record-per-line
 for pipelines. The HTML report is self-contained, marks takeover and dangling
 rows, and opens straight in a browser.
 
+The output extension picks the format when `-format` is not given, so
+`-o report.html` really writes HTML:
+
+```bash
+palm subs.txt -o report.html        # HTML
+palm subs.txt -o results.xml        # XML
+palm subs.txt -o data.json          # JSON array
+palm subs.txt -o report.html -format text   # explicit -format still wins
+```
+
+Convert a saved scan without scanning again:
+
+```bash
+palm -render live.jsonl -format html -o report.html
+palm -render live.jsonl -format xml | xmllint --format -
+palm -render live.jsonl -status     # back to text
+```
+
+This is useful when a scan is already done, or when the pipeline saved
+`live.jsonl` and you want a report later.
+
 Detect what sits in front of the host:
 
 ```bash
@@ -486,6 +507,7 @@ Only scan domains and infrastructure you own or have permission to test. `palm` 
 -q                 only print live URLs, bare and pipe-friendly
 -print string      leading text value: host, url, auto (default "auto")
 -format string     output format: text, jsonl, json, xml, html (default "text")
+-render string     convert an existing JSONL file to -format (no scan)
 -waf               detect the WAF or CDN in front of each host
 -save              write a timestamped copy when output goes to a terminal (default true)
 -save-dir string   directory for -save (default "palm-results")

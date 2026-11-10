@@ -17,6 +17,9 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECON="${RECON_SH:-$HERE/recon.sh}"
 BASE_DIR="${RECON_TUI_BASE:-$PWD/recon}"
+# The palm binary the TUI uses for reports and its own checks. recon.sh is told
+# about it too, so the menu and the pipeline never disagree about which palm ran.
+PALM_BIN="${PALM_BIN:-palm}"
 
 PATH="$HOME/.local/bin:$HOME/go/bin:/usr/local/bin:$PATH"
 export PATH
@@ -68,7 +71,8 @@ do_scan() {
     "TAKEOVER" "Takeover kontrolu (onerilen)" ON \
     "PARAMS"   "Parametre/URL toplama (katana+gau)" ON \
     "HISTORY"  "gau/waybackurls gecmis URL'ler (yavas)" ON \
-    "WAF"      "WAF tespiti (wafw00f)" ON \
+    "WAF"      "WAF tespiti (wafw00f + palm)" ON \
+    "EXPORT"   "Rapor uret: html + json + xml" ON \
     "NUCLEI"   "nuclei sablon taramasi (cok yavas)" OFF \
     "AMASS"    "amass pasif enum (dakikalarca)" OFF) || return
   choices=$(trim "$choices")
@@ -80,11 +84,13 @@ do_scan() {
 
   local args=("-d" "$domain" "-o" "$BASE_DIR/$domain" "-c" "${conc:-100}"
               "--timeout" "${timeout:-10}")
+  [ "$PALM_BIN" != "palm" ] && args+=("--palm" "$PALM_BIN")
   [ "${rate:-0}" != "0" ] && args+=("--rate" "$rate")
   case " $choices " in *"TAKEOVER"*) ;; *) args+=("--no-takeover") ;; esac
   case " $choices " in *"PARAMS"*)   ;; *) args+=("--no-params")   ;; esac
   case " $choices " in *"HISTORY"*)  ;; *) args+=("--no-history")  ;; esac
   case " $choices " in *"WAF"*)      ;; *) args+=("--no-waf")      ;; esac
+  case " $choices " in *"EXPORT"*)   args+=("--export" "html,json,xml") ;; *) args+=("--no-report") ;; esac
   case " $choices " in *"NUCLEI"*)   args+=("--with-nuclei")       ;; esac
   case " $choices " in *"AMASS"*)    args+=("--with-amass")        ;; esac
 
@@ -158,18 +164,19 @@ $outdir"; return; }
 
   local choice
   choice=$(whiptail --title "Sonuclar: $(basename "$outdir")" --menu "Ne yapmak istersin?" \
-    20 $WT_WIDTH 8 \
+    22 $WT_WIDTH 10 \
     "SUMMARY"  "Ozet raporu goster" \
     "LIVE"     "Canli URL listesi (live.txt)" \
     "SUBS"     "Tum subdomainler (subs.txt)" \
     "PARAMS"   "Parametre URL'leri (params.txt)" \
     "WAF"      "WAF listesi (waf.txt)" \
     "NUCLEI"   "Nuclei bulgulari (nuclei.txt)" \
+    "REPORT"   "HTML/JSON/XML rapor uret (varsa ac)" \
     "LOG"      "Calisma logu" \
     "DIR"      "Klasoru ac (ls)" \
     "BACK"     "Geri don" 3>&1 1>&2 2>&3) || return
 
-  local file
+  local file=""
   case "$choice" in
     SUMMARY) file="$outdir/summary.txt" ;;
     LIVE)    file="$outdir/live.txt" ;;
@@ -177,10 +184,15 @@ $outdir"; return; }
     PARAMS)  file="$outdir/params.txt" ;;
     WAF)     file="$outdir/waf.txt" ;;
     NUCLEI)  file="$outdir/nuclei.txt" ;;
+    REPORT)  make_report "$outdir"; return ;;
     LOG)     file="$outdir/run.log" ;;
     DIR)     whiptail --title "Klasor" --textbox <(ls -la "$outdir") 22 $WT_WIDTH || true; return ;;
     BACK)    return ;;
   esac
+
+  # A menu entry that already handled its own action leaves file empty (or the
+  # dialog was cancelled); nothing to display then.
+  [ -n "$file" ] || return
 
   if [ -f "$file" ] && [ -s "$file" ]; then
     # Strip ANSI colours so the textbox does not show escape sequences.
@@ -208,11 +220,45 @@ Once 'Yeni tarama' sec."
   show_run "$BASE_DIR/$choice"
 }
 
-# ------------------------------------------------------------- tool check ----
+# make_report renders report.html / results.json / results.xml from live.jsonl.
+# palm -render does the work and needs no python; when the installed palm is too
+# old the user is told what to install instead of failing silently.
+make_report() {
+  local outdir="$1"
+  local jsonl="$outdir/live.jsonl"
+
+  if [ ! -s "$jsonl" ]; then
+    err "Rapor" "live.jsonl yok:
+$jsonl"
+    return
+  fi
+
+  local palm_bin made=""
+  palm_bin="$PALM_BIN"
+  command -v "$palm_bin" >/dev/null 2>&1 || palm_bin="palm"
+
+  if [ -n "$palm_bin" ] && "$palm_bin" -h 2>/dev/null | grep -q -- '-render'; then
+    "$palm_bin" -render "$jsonl" -format html -o "$outdir/report.html" 2>/dev/null && made="$made html"
+    "$palm_bin" -render "$jsonl" -format json -o "$outdir/results.json" 2>/dev/null && made="$made json"
+    "$palm_bin" -render "$jsonl" -format xml -o "$outdir/results.xml" 2>/dev/null && made="$made xml"
+  fi
+
+  if [ -z "$made" ]; then
+    err "Rapor" "Rapor uretilemedi.
+palm 0.7.1 veya daha yenisi (-render) gerekli.
+Guncelle: sudo palm -update"
+    return
+  fi
+
+  whiptail --title "Rapor" --msgbox "Uretildi:$made
+
+Klasor: $outdir" 12 $WT_WIDTH || true
+}
+
 do_toolcheck() {
   local report=""
   local t state
-  for t in subfinder assetfinder findomain amass katana gau waybackurls wafw00f nuclei palm; do
+  for t in subfinder assetfinder findomain amass katana gau waybackurls wafw00f nuclei "$PALM_BIN"; do
     if ! command -v "$t" >/dev/null 2>&1; then
       state="yok"
     else
@@ -251,4 +297,6 @@ main_menu() {
   done
 }
 
-main_menu
+# Sourced by a test (RECON_TUI_NO_MAIN=1) exposes the functions without opening
+# the menu.
+[ "${RECON_TUI_NO_MAIN:-0}" = "1" ] || main_menu
