@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"io"
 	"net"
@@ -524,6 +525,301 @@ func TestNoSchemeKeepsJSONUrls(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"probed_url":"https://a.example.com"`) {
 		t.Fatalf("JSON url should keep its scheme: %s", out.String())
+	}
+}
+
+func TestParseFlagsPrintAndFormat(t *testing.T) {
+	cfg, err := parseFlags([]string{"-print", "host", "-format", "xml", "-waf"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.printKind != "host" {
+		t.Fatalf("printKind = %q, want host", cfg.printKind)
+	}
+	if cfg.format != formatXML {
+		t.Fatalf("format = %q, want xml", cfg.format)
+	}
+	if !cfg.waf {
+		t.Fatal("waf should be enabled")
+	}
+
+	// -json keeps meaning JSON lines.
+	cfg, err = parseFlags([]string{"-json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.format != formatJSONL {
+		t.Fatalf("format = %q, want jsonl from -json", cfg.format)
+	}
+
+	// Default stays plain text.
+	cfg, err = parseFlags(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.format != formatText {
+		t.Fatalf("default format = %q, want text", cfg.format)
+	}
+	if cfg.printKind != "auto" {
+		t.Fatalf("default printKind = %q, want auto", cfg.printKind)
+	}
+}
+
+func TestParseFlagsRejectsBadFormatAndPrint(t *testing.T) {
+	for _, args := range [][]string{
+		{"-format", "yaml"},
+		{"-print", "domain"},
+		{"-json", "-format", "xml"},
+	} {
+		if _, err := parseFlags(args); err == nil {
+			t.Fatalf("parseFlags(%v) should have failed", args)
+		}
+	}
+}
+
+func TestDisplayValueKinds(t *testing.T) {
+	res := result{
+		Host:      "api.example.com",
+		Live:      true,
+		ProbedURL: "https://api.example.com",
+		URL:       "https://login.example.net/sso",
+	}
+
+	tests := []struct {
+		cfg  config
+		want string
+	}{
+		{config{printKind: "auto", mode: "http"}, "https://api.example.com"},
+		{config{printKind: "host", mode: "http"}, "api.example.com"},
+		{config{printKind: "url", mode: "http"}, "https://api.example.com"},
+		{config{printKind: "auto", mode: "dns"}, "api.example.com"},
+		{config{noScheme: true, mode: "http"}, "api.example.com"},
+	}
+	for _, tc := range tests {
+		if got := displayValue(res, tc.cfg); got != tc.want {
+			t.Errorf("displayValue(%+v) = %q, want %q", tc.cfg, got, tc.want)
+		}
+	}
+}
+
+func TestTextOutputPrintHostIsAlwaysABareHost(t *testing.T) {
+	results := []result{{
+		Host: "api.example.com", Live: true,
+		ProbedURL: "https://api.example.com", StatusCode: 200,
+	}}
+
+	var out bytes.Buffer
+	if err := writeResults(&out, results, config{mode: "http", printKind: "host"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); got != "api.example.com\n" {
+		t.Fatalf("output = %q, want the bare host", got)
+	}
+
+	out.Reset()
+	if err := writeResults(&out, results, config{mode: "http", printKind: "url"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); got != "https://api.example.com\n" {
+		t.Fatalf("output = %q, want the URL", got)
+	}
+}
+
+func TestDetectWAF(t *testing.T) {
+	tests := []struct {
+		name    string
+		header  map[string]string
+		cookies []string
+		body    string
+		want    string
+	}{
+		{"cloudflare header", map[string]string{"Cf-Ray": "abc123-SOF"}, nil, "", "cloudflare"},
+		{"cloudflare cookie", nil, []string{"__cf_bm"}, "", "cloudflare"},
+		{"cloudfront", map[string]string{"X-Cache": "Hit from cloudfront"}, nil, "", "aws-cloudfront"},
+		{"elb", map[string]string{"Server": "awselb/2.0"}, nil, "", "aws-elb"},
+		{"akamai cookie", nil, []string{"_abck"}, "", "akamai"},
+		{"imperva header", map[string]string{"X-Iinfo": "1-2-3"}, nil, "", "imperva-incapsula"},
+		{"f5 block page", nil, nil, "The requested URL was rejected. Please consult with your administrator.", "f5-big-ip"},
+		{"sucuri", map[string]string{"X-Sucuri-ID": "11001"}, nil, "", "sucuri"},
+		{"fastly", map[string]string{"X-Served-By": "cache-sof1510"}, nil, "", "fastly"},
+		{"merlin cdn", map[string]string{"Via": "HTTP/2.0 Merlin CDN"}, nil, "", "merlin-cdn"},
+		{"wordfence body", nil, nil, "This site is protected by Wordfence", "wordfence"},
+		{"nothing", map[string]string{"Server": "nginx"}, nil, "<html>hello</html>", ""},
+	}
+
+	for _, tc := range tests {
+		header := http.Header{}
+		for k, v := range tc.header {
+			header.Set(k, v)
+		}
+		var cookies []*http.Cookie
+		for _, name := range tc.cookies {
+			cookies = append(cookies, &http.Cookie{Name: name, Value: "x"})
+		}
+		if got := detectWAF(header, cookies, []byte(tc.body)); got != tc.want {
+			t.Errorf("%s: detectWAF = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestWAFVisibleInOutput(t *testing.T) {
+	res := result{Host: "a.example.com", Live: true, ProbedURL: "https://a.example.com",
+		StatusCode: 200, WAF: "cloudflare"}
+
+	got := formatHTTPResult(res, config{status: true, waf: true})
+	if !strings.Contains(got, "waf=cloudflare") {
+		t.Fatalf("formatted line = %q, want the WAF", got)
+	}
+}
+
+func TestJSONArrayFormat(t *testing.T) {
+	results := []result{
+		{Host: "a.example.com", Live: true, ProbedURL: "https://a.example.com"},
+		{Host: "b.example.com", Live: false, Error: "no such host"},
+	}
+
+	var out bytes.Buffer
+	if err := writeResults(&out, results, config{format: formatJSON}); err != nil {
+		t.Fatal(err)
+	}
+
+	var decoded []result
+	if err := json.Unmarshal(out.Bytes(), &decoded); err != nil {
+		t.Fatalf("output is not a valid JSON array: %v\n%s", err, out.String())
+	}
+	if len(decoded) != 2 {
+		t.Fatalf("decoded %d results, want 2", len(decoded))
+	}
+	// A report format keeps dead hosts with their error.
+	if decoded[1].Error == "" {
+		t.Fatal("dead host lost its error in the JSON report")
+	}
+}
+
+func TestXMLFormatIsWellFormed(t *testing.T) {
+	results := []result{
+		{Host: "a.example.com", Live: true, ProbedURL: "https://a.example.com",
+			StatusCode: 200, Title: "Tom & Jerry <3", WAF: "cloudflare",
+			IPs: []string{"1.2.3.4"}},
+		{Host: "b.example.com", Live: false, Error: "no such host"},
+	}
+
+	var out bytes.Buffer
+	if err := writeResults(&out, results, config{format: formatXML}); err != nil {
+		t.Fatal(err)
+	}
+
+	type xmlResult struct {
+		Host  string   `xml:"host"`
+		Title string   `xml:"title"`
+		IPs   []string `xml:"ip"`
+		Error string   `xml:"error"`
+	}
+	var doc struct {
+		XMLName xml.Name    `xml:"results"`
+		Results []xmlResult `xml:"result"`
+	}
+	if err := xml.Unmarshal(out.Bytes(), &doc); err != nil {
+		t.Fatalf("output is not valid XML: %v\n%s", err, out.String())
+	}
+	if len(doc.Results) != 2 {
+		t.Fatalf("decoded %d results, want 2", len(doc.Results))
+	}
+	if doc.Results[0].Title != "Tom & Jerry <3" {
+		t.Fatalf("title round-trip = %q, want the escaped text back", doc.Results[0].Title)
+	}
+	if len(doc.Results[0].IPs) != 1 || doc.Results[0].IPs[0] != "1.2.3.4" {
+		t.Fatalf("ips = %v, want [1.2.3.4]", doc.Results[0].IPs)
+	}
+}
+
+func TestXMLEscapeDropsControlCharacters(t *testing.T) {
+	got := xmlEscape("a\x1bb<c")
+	if strings.ContainsAny(got, "\x1b") {
+		t.Fatalf("escape kept a control character: %q", got)
+	}
+	if got != "ab&lt;c" {
+		t.Fatalf("xmlEscape = %q, want %q", got, "ab&lt;c")
+	}
+}
+
+func TestHTMLFormatEscapesAndMarksFindings(t *testing.T) {
+	results := []result{
+		{Host: "ok.example.com", Live: true, ProbedURL: "https://ok.example.com",
+			StatusCode: 200, Title: `<script>alert(1)</script>`, WAF: "cloudflare"},
+		{Host: "bad.example.com", Live: true, ProbedURL: "https://bad.example.com",
+			StatusCode: 200, Takeover: true, Provider: "aws-s3"},
+	}
+
+	var out bytes.Buffer
+	if err := writeResults(&out, results, config{format: formatHTML}); err != nil {
+		t.Fatal(err)
+	}
+	page := out.String()
+
+	if strings.Contains(page, "<script>alert(1)</script>") {
+		t.Fatal("HTML output did not escape the title")
+	}
+	if !strings.Contains(page, "&lt;script&gt;") {
+		t.Fatal("escaped title missing from the HTML output")
+	}
+	if !strings.Contains(page, `class="bad"`) {
+		t.Fatal("takeover row is not marked")
+	}
+	if !strings.Contains(page, "</table>") || !strings.Contains(page, "</html>") {
+		t.Fatal("HTML output is not closed properly")
+	}
+}
+
+func TestReportFormatsKeepDeadHosts(t *testing.T) {
+	dead := result{Host: "b.example.com", Live: false, Error: "timeout"}
+
+	for _, format := range []string{formatJSON, formatXML, formatHTML} {
+		var out bytes.Buffer
+		if err := writeResults(&out, []result{dead}, config{format: format}); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(out.String(), "b.example.com") {
+			t.Errorf("%s report dropped a dead host", format)
+		}
+	}
+
+	// Plain text still prints only live hosts.
+	var out bytes.Buffer
+	if err := writeResults(&out, []result{dead}, config{format: formatText}); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "" {
+		t.Fatalf("text output printed a dead host: %q", out.String())
+	}
+}
+
+func TestFormatExtensionAndAutoSaveName(t *testing.T) {
+	tests := map[string]string{
+		formatText: "txt", formatJSONL: "jsonl", formatJSON: "json",
+		formatXML: "xml", formatHTML: "html",
+	}
+	for format, want := range tests {
+		if got := formatExtension(format); got != want {
+			t.Errorf("formatExtension(%s) = %q, want %q", format, got, want)
+		}
+	}
+
+	dir := t.TempDir()
+	file, path, err := openAutoSave(config{saveDir: dir, format: formatHTML}, "api.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	if filepath.Ext(path) != ".html" {
+		t.Fatalf("auto-save path = %q, want a .html extension", path)
+	}
+	if !strings.HasPrefix(filepath.Base(path), "api-") {
+		t.Fatalf("auto-save name = %q, want it to start with the first label", filepath.Base(path))
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("auto-save file was not created: %v", err)
 	}
 }
 
@@ -1315,10 +1611,17 @@ func TestStreamingAndSortedOutputMatch(t *testing.T) {
 	}
 
 	var streamed bytes.Buffer
+	em := newEmitter(cfg)
+	if err := em.Begin(&streamed); err != nil {
+		t.Fatal(err)
+	}
 	for _, res := range results {
-		if err := writeResult(&streamed, res, cfg); err != nil {
+		if err := em.Emit(&streamed, res); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := em.End(&streamed); err != nil {
+		t.Fatal(err)
 	}
 
 	if sorted.String() != streamed.String() {

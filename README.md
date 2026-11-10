@@ -235,6 +235,33 @@ Show these examples from the CLI:
 palm -tools
 ```
 
+## Full Pipeline Script
+
+`recon.sh` chains palm with the usual recon tools, so one command goes
+from a domain to live endpoints, parameters and WAF notes:
+
+```bash
+chmod +x recon.sh
+./recon.sh -d example.com
+./recon.sh -d example.com --rate 5 -c 50
+./recon.sh -d example.com -i subs.txt --no-history
+./recon.sh -d example.com -o recon/example --with-nuclei
+```
+
+Stages: passive enumeration (subfinder, assetfinder, findomain, amass) ->
+resolve with wildcard filtering through palm -> HTTP probe with status, title,
+server, TLS and takeover -> parameter collection with katana, gau and
+waybackurls -> WAF fingerprinting with wafw00f -> optional nuclei scan.
+
+Everything lands in one directory: `subs.txt`, `resolved.txt`, `live.txt`,
+`live.jsonl`, `params.txt`, `params.uniq`, `waf.txt`, `summary.txt`, plus
+`run.log`. Stages are resumable, so a second run only fills in what is missing;
+`--force` reruns them all.
+
+Every external tool is optional and every call has a timeout with stdin closed,
+so a missing or half-broken tool (or one that asks for a password) is skipped
+with a notice instead of stalling the run.
+
 ## Modes
 
 ```text
@@ -323,6 +350,57 @@ Shared hosting suffixes such as `github.io`, `appspot.com`, `herokuapp.com`, `ne
 
 ## Output and Speed Control
 
+Pick what each line starts with:
+
+```bash
+palm subs.txt -print host        # api.example.com          (bare hostname)
+palm subs.txt -print url         # https://api.example.com  (full URL)
+palm subs.txt -print auto        # default: URL for http modes, host for dns
+```
+
+`-print host` is the fix for "is this a domain or a URL?" confusion: with it,
+every text line starts with a hostname, and `final=` / `location=` values lose
+their scheme too. `-no-scheme` still exists and keeps the path
+(`api.example.com/login`), which is different from `-print host`.
+
+Export results in the shape you need:
+
+```bash
+palm subs.txt -format text        # one line per live host (default)
+palm subs.txt -format jsonl       # JSON lines, one object per host
+palm subs.txt -format json        # a single JSON array
+palm subs.txt -format xml         # <results><result>...</result></results>
+palm subs.txt -format html -o report.html
+```
+
+`json`, `xml` and `html` are reports: they include dead hosts with their error so
+the file explains what was checked. `text` and `jsonl` stay one-record-per-line
+for pipelines. The HTML report is self-contained, marks takeover and dangling
+rows, and opens straight in a browser.
+
+Detect what sits in front of the host:
+
+```bash
+palm subs.txt -status -waf
+```
+
+`-waf` fingerprints Cloudflare, Akamai, Imperva, F5, Sucuri, Fastly, Merlin CDN,
+AWS (WAF, CloudFront, ELB), Azure Front Door, Varnish, Wordfence, ModSecurity,
+Google Cloud Armor and Envoy from the response palm already fetched. No extra
+request.
+
+Auto-save while looking at the screen:
+
+```bash
+palm subs.txt -status -title   # writes palm-results/<name>-<timestamp>.txt too
+palm subs.txt -save=false       # turn it off
+```
+
+When stdout is a terminal and no `-o` is given, palm writes a timestamped copy
+next to the output so closing the window does not lose the scan. Piped runs are
+never touched. `-save-dir` chooses where the file goes. The extension follows
+`-format`, so `-format html` auto-saves an `.html` report.
+
 Stream results as they arrive instead of waiting for the whole scan:
 
 ```bash
@@ -406,6 +484,11 @@ Only scan domains and infrastructure you own or have permission to test. `palm` 
 -wildcard          detect wildcard DNS and mark matching hosts
 -fw                drop hosts that match a wildcard DNS record
 -q                 only print live URLs, bare and pipe-friendly
+-print string      leading text value: host, url, auto (default "auto")
+-format string     output format: text, jsonl, json, xml, html (default "text")
+-waf               detect the WAF or CDN in front of each host
+-save              write a timestamped copy when output goes to a terminal (default true)
+-save-dir string   directory for -save (default "palm-results")
 -no-sort           print in completion order instead of host order
 -no-scheme         omit the http:// or https:// prefix in text output
 -progress          print progress to stderr

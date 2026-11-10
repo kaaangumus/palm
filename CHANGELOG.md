@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.0
+
+Output clarity, WAF checks and export formats:
+
+- `-print host|url|auto` picks what a text line starts with. `-print host` is the
+  fix for "domain or URL?" ambiguity: every line is a bare hostname, and
+  `final=`/`location=` lose their scheme too.
+- `-waf` fingerprints the WAF or CDN in front of each host (Cloudflare, Akamai,
+  Imperva, F5, Sucuri, Fastly, Merlin CDN, AWS WAF/CloudFront/ELB, Azure Front
+  Door, Varnish, Wordfence, ModSecurity, Google Cloud Armor, Envoy) from headers,
+  cookies and body of the probe palm already makes. No extra request.
+- `-format text|jsonl|json|xml|html` adds single-array JSON, XML and a
+  self-contained HTML report. Reports include dead hosts with their error;
+  text and jsonl stay line-oriented for pipelines.
+- Auto-save: with a terminal on stdout and no `-o`, results are also written to
+  `palm-results/<name>-<timestamp>.<ext>`, so closing the window does not lose
+  the scan. `-save=false` disables it, `-save-dir` moves it. Piped runs are
+  unaffected.
+
 ## 0.6.4
 
 Takeover detection was too narrow: 10 fingerprints, and the list only ran when the CNAME already matched one of them, so a whole class of findings was invisible.
