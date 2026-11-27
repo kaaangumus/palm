@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased
+
+Fixes:
+
+- `-render` now runs before the stdin/terminal check, so it works from an interactive shell and with `</dev/null`. `stdinIsTerminal` uses the platform `isTerminal` probe; `/dev/null` and `NUL` are character devices but not terminals.
+- `-render` treats a closed pipe as a normal early exit.
+- `-fw` is applied to JSON and XML reports too, not only text, JSONL and HTML.
+- `-waf` uses GET when the body is needed, so body-based WAF signatures work without `-title`.
+- `-takeover` keeps checking the CNAME chain when DNS resolution fails, so dangling CNAMEs on non-resolving hosts can be reported.
+- Added `-include-dead`: JSONL output keeps non-live hosts too, so dangling CNAME records survive a line-oriented pipeline.
+
+## 0.7.4
+
+- Input is stricter: a host must contain a dot and only valid DNS label
+  characters. Before, banner text from tools that print headings on stdout
+  ("Session Scope", "FQDN:") was taken for a hostname and each one cost a DNS
+  lookup. Checked against real tool output: junk lines are dropped, `subs.txt`
+  files and `httpx`/`dnsx` pipes still work.
+- `-tools` notes corrected after running every example: `amass` v5 needs API keys
+  in a config file and can finish with zero results without them, so the example
+  says to verify its output before piping.
+
+## 0.7.3
+
+- `-tools` now lists examples that were actually run end to end, and says what to
+  expect: `amass` passive is slow and can print nothing for a small domain,
+  `chaos` needs `CHAOS_KEY`, and a missing `dnsx` is covered by `palm -mode dns`.
+- Added the `httpx` and `dnsx` pipelines to `-tools`; both were working but
+  undocumented.
+- Examples now pass `-status`, so the output shows what the tool found instead of
+  a bare URL.
+
+## 0.7.2
+
+Efficiency: a working HTTPS host now costs one request instead of two.
+
+- HTTPS is tried first and the HTTP attempt only starts if HTTPS has not answered
+  after 300 ms. Before, both schemes were fired in parallel for every host, so a
+  scan always sent twice the requests it needed. Measured on a counter server:
+  10 hosts went from 20 requests to 10.
+- Under `-rate` this doubles throughput, because each host used to consume two
+  tokens: 8 hosts at 4 req/s took 3.8 s, now 1.8 s.
+- The fallback timer starts when the HTTPS request is actually on the wire, not
+  when it is queued, so a rate-limited scan does not trigger both schemes.
+- DNS is resolved once per host: the address from the DNS phase is reused by the
+  HTTP dial instead of being looked up a second time. This also stops the two
+  phases from disagreeing when DNS answers change mid-scan.
+- Results are unchanged: same live set, same scheme, same status codes, and the
+  scheme choice is still deterministic across runs.
+
 ## 0.7.1
 
 - `-o` now picks the format from its extension when `-format` is not given, so
@@ -7,13 +57,6 @@
   `-format` still wins.
 - Added `-render <file>`: converts a saved palm JSONL result into text, JSON,
   XML or HTML without scanning again.
-- `recon.sh --export json,xml,html` writes `results.json`, `results.xml` and
-  `report.html` from `live.jsonl` using `palm -render`, so the HTML report no
-  longer depends on python3.
-- `recon.sh` only passes `-waf`/`-render` when the installed palm supports them,
-  so an older palm degrades instead of failing a stage.
-- `recon-tui.sh` gained an EXPORT option, a "produce report" action for past
-  runs, and a `PALM_BIN` setting shared with recon.sh.
 
 ## 0.7.0
 

@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/iotest"
 	"time"
@@ -36,6 +37,15 @@ func TestNormalizeHost(t *testing.T) {
 		"127.0.0.1":                             "",
 		"# comment":                             "",
 		"https://sub.example.com:8443/path?a=b": "sub.example.com",
+		// Banner/heading text from tools must not become a host.
+		"Session Scope":           "",
+		"FQDN:":                   "",
+		"junk":                    "",
+		"not_a_host":              "",
+		"a..b.example.com":        "",
+		"bad host.example.com":    "",
+		"under_score.example.com": "under_score.example.com",
+		"dash-name.example.com":   "dash-name.example.com",
 	}
 
 	for input, want := range tests {
@@ -943,6 +953,140 @@ func TestRenderWritesOutputFile(t *testing.T) {
 	if !strings.Contains(string(data), "<!DOCTYPE html>") {
 		t.Fatalf("output file is not HTML:\n%s", data)
 	}
+}
+
+// A host that answers HTTPS must cost exactly one request: the HTTP fallback
+// must not fire at all. This is what halves traffic (and doubles -rate
+// throughput) on the common case.
+func TestCheckHTTPDoesNotSendHTTPWhenHTTPSWorks(t *testing.T) {
+	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("secure"))
+	}))
+	defer tlsSrv.Close()
+
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("plain"))
+	}))
+	defer httpSrv.Close()
+
+	var httpDials int32
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				var d net.Dialer
+				_, port, _ := net.SplitHostPort(addr)
+				if port == "443" {
+					return d.DialContext(ctx, network, tlsSrv.Listener.Addr().String())
+				}
+				atomic.AddInt32(&httpDials, 1)
+				return d.DialContext(ctx, network, httpSrv.Listener.Addr().String())
+			},
+		},
+	}
+
+	probe, err := checkHTTP(context.Background(), "example.test", config{timeout: 3 * time.Second}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe.URL != "https://example.test" {
+		t.Fatalf("probe URL = %q, want HTTPS", probe.URL)
+	}
+
+	// Give a stray goroutine a moment to dial before asserting the count.
+	time.Sleep(80 * time.Millisecond)
+	if got := atomic.LoadInt32(&httpDials); got != 0 {
+		t.Fatalf("HTTP was dialed %d times for an HTTPS host, want 0", got)
+	}
+}
+
+// A host whose HTTPS is closed must still be found over HTTP.
+func TestCheckHTTPFallsBackAndDialsHTTPOnce(t *testing.T) {
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("plain"))
+	}))
+	defer httpSrv.Close()
+
+	var httpDials int32
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				var d net.Dialer
+				_, port, _ := net.SplitHostPort(addr)
+				if port == "443" {
+					// Connection refused, the usual case for an http-only host.
+					return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errConnectionRefused{}}
+				}
+				atomic.AddInt32(&httpDials, 1)
+				return d.DialContext(ctx, network, httpSrv.Listener.Addr().String())
+			},
+		},
+	}
+
+	probe, err := checkHTTP(context.Background(), "example.test", config{timeout: 2 * time.Second}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe.URL != "http://example.test" {
+		t.Fatalf("probe URL = %q, want HTTP fallback", probe.URL)
+	}
+	if got := atomic.LoadInt32(&httpDials); got != 1 {
+		t.Fatalf("HTTP dialed %d times, want exactly 1", got)
+	}
+}
+
+type errConnectionRefused struct{}
+
+func (errConnectionRefused) Error() string   { return "connect: connection refused" }
+func (errConnectionRefused) Timeout() bool   { return false }
+func (errConnectionRefused) Temporary() bool { return false }
+
+// The DNS cache is what makes "both" mode resolve each host once: the dial must
+// reuse the answer the DNS phase stored instead of asking again.
+func TestResolverPoolCachesLookups(t *testing.T) {
+	pool := newResolverPool(nil)
+	pool.store("cached.example", []string{"10.0.0.1"})
+
+	ips, ok := pool.cached("cached.example")
+	if !ok {
+		t.Fatal("stored answer was not cached")
+	}
+	if len(ips) != 1 || ips[0] != "10.0.0.1" {
+		t.Fatalf("cached = %v, want [10.0.0.1]", ips)
+	}
+
+	// A dial for a cached name must not resolve again: point the pool at a
+	// resolver that would fail, and require the dial to still find the address.
+	pool.resolvers = nil
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if got, err := pool.lookupHost(ctx, "cached.example"); err != nil || len(got) != 1 {
+		t.Fatalf("lookupHost did not serve the cache: %v %v", got, err)
+	}
+}
+
+func TestResolverPoolDialUsesCache(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	host, port, err := net.SplitHostPort(server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pool := newResolverPool(nil)
+	pool.store("cached.test", []string{host})
+	dial := pool.dialContext(2 * time.Second)
+	conn, err := dial(context.Background(), "tcp", net.JoinHostPort("cached.test", port))
+	if err != nil {
+		t.Fatalf("dial through the DNS cache failed: %v", err)
+	}
+	_ = conn.Close()
 }
 
 func TestParseFlagsDefaultsToBothMode(t *testing.T) {
@@ -2044,15 +2188,29 @@ func TestNewHTTPClientUsesResolverPool(t *testing.T) {
 	}
 }
 
-func TestNewHTTPClientWithoutResolverKeepsDefaultDialer(t *testing.T) {
-	client := newHTTPClient(config{concurrency: 1, timeout: time.Second, followRedirects: true}, nil)
+func TestNewHTTPClientWithoutResolverStillDialsThroughPool(t *testing.T) {
+	// The pool exists even without -r: it carries the DNS cache. Dialling must
+	// still work, and must not fall back to a nil DialContext.
+	client := newHTTPClient(config{concurrency: 1, timeout: time.Second, followRedirects: true}, newResolverPool(nil))
 	transport, ok := client.Transport.(*http.Transport)
 	if !ok {
 		t.Fatalf("transport = %T, want *http.Transport", client.Transport)
 	}
-	if transport.DialContext != nil {
-		t.Fatal("DialContext must stay nil without a resolver pool")
+	if transport.DialContext == nil {
+		t.Fatal("DialContext must be set so HTTP reuses the DNS cache")
 	}
+
+	// An IP literal bypasses DNS entirely and must still connect.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	conn, err := transport.DialContext(context.Background(), "tcp", server.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial through IP literal: %v", err)
+	}
+	_ = conn.Close()
 }
 
 func TestRunChecksReturnsAfterCancellation(t *testing.T) {
@@ -2092,4 +2250,158 @@ func TestHTTPClientDialsIPLiteralsDirectly(t *testing.T) {
 		t.Fatalf("dial through IP literal: %v", err)
 	}
 	_ = conn.Close()
+}
+
+func TestStdinIsTerminalRejectsDevNull(t *testing.T) {
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	old := os.Stdin
+	os.Stdin = f
+	defer func() { os.Stdin = old }()
+
+	if stdinIsTerminal() {
+		t.Fatalf("%s must not be treated as a terminal", os.DevNull)
+	}
+}
+
+func TestRunRendersBeforeTerminalCheck(t *testing.T) {
+	old := stdinIsTerminal
+	stdinIsTerminal = func() bool { return true }
+	defer func() { stdinIsTerminal = old }()
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "in.jsonl")
+	if err := os.WriteFile(src, []byte(`{"host":"a.example.com","live":true,"probed_url":"https://a.example.com"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "out.html")
+
+	var stdout bytes.Buffer
+	if err := run([]string{"-render", src, "-o", dst}, strings.NewReader(""), &stdout, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stdout.String(), "Usage:") {
+		t.Fatalf("render printed help instead of running:\n%s", stdout.String())
+	}
+	if _, err := os.Stat(dst); err != nil {
+		t.Fatalf("render output missing: %v", err)
+	}
+}
+
+func TestFilterWildcardAppliesToEveryFormat(t *testing.T) {
+	results := []result{
+		{Host: "real.example.com", Live: true, ProbedURL: "https://real.example.com"},
+		{Host: "fake.example.com", Live: true, ProbedURL: "https://fake.example.com", Wildcard: true},
+	}
+
+	for _, format := range []string{formatText, formatJSONL, formatJSON, formatXML, formatHTML} {
+		var out bytes.Buffer
+		if err := writeResults(&out, results, config{format: format, filterWildcard: true}); err != nil {
+			t.Fatalf("%s: %v", format, err)
+		}
+		if strings.Contains(out.String(), "fake.example.com") {
+			t.Errorf("%s kept a wildcard host:\n%s", format, out.String())
+		}
+		if !strings.Contains(out.String(), "real.example.com") {
+			t.Errorf("%s dropped a real host:\n%s", format, out.String())
+		}
+	}
+}
+
+func TestRequestURLUsesGETForWAFAutomatically(t *testing.T) {
+	var mu sync.Mutex
+	var gotMethod string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotMethod = r.Method
+		mu.Unlock()
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	probe, err := requestURL(context.Background(), server.URL, config{timeout: 2 * time.Second, waf: true}, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", probe.StatusCode)
+	}
+	mu.Lock()
+	method := gotMethod
+	mu.Unlock()
+	if method != http.MethodGet {
+		t.Fatalf("method = %q, want GET when -waf needs the body", method)
+	}
+}
+
+func TestCheckHostRunsTakeoverAfterDNSFailure(t *testing.T) {
+	oldCNAME := lookupCNAMEFunc
+	oldHost := lookupHostForTakeover
+	defer func() {
+		lookupCNAMEFunc = oldCNAME
+		lookupHostForTakeover = oldHost
+	}()
+
+	lookupCNAMEFunc = func(context.Context, string, *resolverPool) (string, error) {
+		return "gone.elasticbeanstalk.com.", nil
+	}
+	lookupHostForTakeover = func(context.Context, string, *resolverPool) ([]string, error) {
+		return nil, &net.DNSError{Err: "no such host", Name: "gone.elasticbeanstalk.com", IsNotFound: true}
+	}
+
+	cfg := config{mode: "both", timeout: 200 * time.Millisecond, takeover: true}
+	client := &http.Client{Timeout: cfg.timeout}
+	resolvers := newResolverPool([]string{"127.0.0.1:1"})
+
+	res := checkHost(context.Background(), "gone.example.com", cfg, client, resolvers, nil)
+	if !res.Takeover {
+		t.Fatalf("takeover = false, want a dangling CNAME takeover: %+v", res)
+	}
+	if res.Provider != "aws-elasticbeanstalk" {
+		t.Fatalf("provider = %q, want aws-elasticbeanstalk", res.Provider)
+	}
+	if !res.Live {
+		t.Fatal("a vulnerable takeover should be reported live")
+	}
+}
+
+func TestIncludeDeadAddsDeadHostsToJSONL(t *testing.T) {
+	results := []result{
+		{Host: "live.example.com", Live: true, ProbedURL: "https://live.example.com"},
+		{Host: "dead.example.com", Live: false, Error: "timeout"},
+		{Host: "wild.example.com", Live: true, ProbedURL: "https://wild.example.com", Wildcard: true},
+	}
+
+	var out bytes.Buffer
+	if err := writeResults(&out, results, config{format: formatJSONL, includeDead: true, filterWildcard: true}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "dead.example.com") {
+		t.Fatalf("-include-dead dropped a dead host:\n%s", got)
+	}
+	if strings.Contains(got, "wild.example.com") {
+		t.Fatalf("-include-dead bypassed -fw:\n%s", got)
+	}
+
+	// Without the flag, JSONL stays live-only.
+	out.Reset()
+	if err := writeResults(&out, results, config{format: formatJSONL}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "dead.example.com") {
+		t.Fatalf("default JSONL printed a dead host:\n%s", out.String())
+	}
+
+	cfg, err := parseFlags([]string{"-include-dead"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.includeDead {
+		t.Fatal("-include-dead did not set includeDead")
+	}
 }

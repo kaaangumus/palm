@@ -32,7 +32,7 @@ import (
 	"time"
 )
 
-var version = "0.7.1"
+var version = "0.7.4"
 
 const modulePath = "github.com/kaaangumus/palm"
 const latestReleaseURL = "https://api.github.com/repos/kaaangumus/palm/releases/latest"
@@ -72,6 +72,9 @@ type config struct {
 
 	// Output shape. format is one of: text, jsonl, json, xml, html.
 	format string
+	// includeDead keeps non-live hosts in JSONL output (reports already keep
+	// them), so dangling CNAMEs can be reviewed from a line-oriented file.
+	includeDead bool
 	// printKind decides what the leading value of a text line is:
 	// "auto" (URL for http modes, host for dns), "url", or "host".
 	printKind string
@@ -84,6 +87,11 @@ type config struct {
 	savedPath string
 	// renderFile converts an existing JSONL result file instead of scanning.
 	renderFile string
+	// onDispatch, when set, runs right after a request has passed the rate
+	// limiter and is about to be sent. checkHTTP uses it to start the HTTP
+	// fallback timer only once the HTTPS request is really on the wire, so rate
+	// limiting does not make both schemes fire.
+	onDispatch func()
 }
 
 // Output formats accepted by -format.
@@ -163,6 +171,13 @@ type resolverPool struct {
 	addrs     []string
 	resolvers []*net.Resolver
 	next      uint64
+
+	// cache keeps answers for the length of one scan so the HTTP dial reuses
+	// the address the DNS phase already resolved. Without it every host is
+	// looked up twice (phase one, then again inside the transport), which also
+	// lets the two phases disagree when DNS answers change mid-run.
+	cacheMu sync.RWMutex
+	cache   map[string][]string
 }
 
 // rateLimiter spaces HTTP requests so a scan stays polite. A nil limiter means
@@ -606,14 +621,23 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return err
 	}
 	cfg.progressOut = stderr
-	if cfg.inputFile == "" && stdinIsTerminal() {
-		fmt.Fprint(stdout, usageLang(cfg.lang))
+
+	// -render converts a saved JSONL file: no scanning, no network. Handle it
+	// before the stdin check: it needs no input, and a terminal (or /dev/null)
+	// must not turn it into a help screen.
+	if cfg.renderFile != "" {
+		if err := renderResults(cfg, stdout); err != nil {
+			if isBrokenPipe(err) {
+				return nil
+			}
+			return err
+		}
 		return nil
 	}
 
-	// -render converts a saved JSONL file: no scanning, no network.
-	if cfg.renderFile != "" {
-		return renderResults(cfg, stdout)
+	if cfg.inputFile == "" && stdinIsTerminal() {
+		fmt.Fprint(stdout, usageLang(cfg.lang))
+		return nil
 	}
 
 	hosts, err := readHosts(cfg.inputFile, stdin)
@@ -825,6 +849,7 @@ func parseFlags(args []string) (config, error) {
 	filterCodes := fs.String("fc", "", "filter HTTP status codes")
 	var headers headerFlags
 	fs.BoolVar(&cfg.jsonOut, "json", false, "write JSON lines (same as -format jsonl)")
+	fs.BoolVar(&cfg.includeDead, "include-dead", false, "include non-live hosts in JSONL output")
 	fs.BoolVar(&cfg.status, "status", false, "include HTTP status in text output")
 	fs.BoolVar(&cfg.title, "title", false, "include page title")
 	fs.BoolVar(&cfg.server, "server", false, "include server header")
@@ -1077,12 +1102,11 @@ func parseCodes(raw string) (map[int]struct{}, error) {
 	return codes, nil
 }
 
-func stdinIsTerminal() bool {
-	info, err := os.Stdin.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
+// stdinIsTerminal uses the platform terminal probe. Stat alone is not enough:
+// /dev/null (and NUL) are character devices, so a redirected run would look
+// interactive and print help instead of reading stdin.
+var stdinIsTerminal = func() bool {
+	return isTerminal(os.Stdin)
 }
 
 func checkForUpdate(w io.Writer) error {
@@ -1422,6 +1446,7 @@ Flags:
   -mc string         match HTTP status codes, comma-separated
   -fc string         filter HTTP status codes, comma-separated
   -json              write JSON lines
+  -include-dead      include non-live hosts in JSONL output
   -status            include HTTP status in text output
   -title             include page title
   -server            include server header
@@ -1477,6 +1502,7 @@ Parametreler:
   -mc string         eslesecek HTTP status kodlari, virgulle ayrilir
   -fc string         filtrelenecek HTTP status kodlari, virgulle ayrilir
   -json              JSON lines formatinda yaz
+  -include-dead      JSONL ciktisina live olmayan hostlari da ekle
   -status            text ciktida HTTP status veya DNS IP bilgisini goster
   -title             sayfa basligini goster
   -server            server header bilgisini goster
@@ -1541,11 +1567,22 @@ func localizedToolsUsageLang(lang string) string {
 func trToolsUsage() string {
 	return `palm ile yaygin arac ornekleri:
 
-  subfinder -d example.com -silent | palm
-  assetfinder --subs-only example.com | palm
-  amass enum -passive -d example.com | palm
-  findomain -t example.com -q | palm
-  chaos -d example.com -silent | palm
+  subfinder -d example.com -silent | palm -status
+  assetfinder --subs-only example.com | palm -status
+  findomain -t example.com -q | palm -status
+  amass enum -passive -d example.com -silent | palm -status
+
+  httpx -l hosts.txt -silent | palm -status
+  dnsx -l subs.txt -silent | palm -mode http -status
+
+Notlar:
+  amass  v5 yuzlerce pasif kaynaga gider ve anlamli sonuc icin config dosyasinda
+         API anahtarlari ister; anahtarsiz sifir sonucla bitebilir. Ayri
+         calistir, sonuc geldigini dogrula, sonra dosyayi palm'a ver.
+  chaos  Chaos API anahtari ister: export CHAOS_KEY=... ardindan
+         chaos -d example.com -silent | palm -status
+  dnsx   projectdiscovery ile gelir; kurulu degilse palm -mode dns ayni isi
+         dnsx olmadan yapar.
 
 Not: palm stdin'den okur, txt dosyasi da kabul eder: palm subs.txt
 `
@@ -1554,11 +1591,22 @@ Not: palm stdin'den okur, txt dosyasi da kabul eder: palm subs.txt
 func toolsUsage() string {
 	return `Common tool pipelines for palm:
 
-  subfinder -d example.com -silent | palm
-  assetfinder --subs-only example.com | palm
-  amass enum -passive -d example.com | palm
-  findomain -t example.com -q | palm
-  chaos -d example.com -silent | palm
+  subfinder -d example.com -silent | palm -status
+  assetfinder --subs-only example.com | palm -status
+  findomain -t example.com -q | palm -status
+  amass enum -passive -d example.com -silent | palm -status
+
+  httpx -l hosts.txt -silent | palm -status
+  dnsx -l subs.txt -silent | palm -mode http -status
+
+Notes:
+  amass  v5 runs several hundred passive sources and needs API keys in a config
+         file to return much; without one it can finish with zero results. Run it
+         on its own, check that it found something, then feed that file to palm.
+  chaos  needs a Chaos API key: export CHAOS_KEY=... then
+         chaos -d example.com -silent | palm -status
+  dnsx   comes with projectdiscovery; if it is not installed, palm -mode dns
+         does the same job without it.
 
 Tip: palm reads stdin and accepts txt files too: palm subs.txt
 `
@@ -1649,13 +1697,37 @@ func normalizeHost(line string) string {
 		raw = raw[1 : len(raw)-1]
 	}
 	raw = strings.Trim(strings.ToLower(raw), " .")
-	if raw == "" || strings.ContainsAny(raw, `/\`) {
+	if raw == "" || strings.ContainsAny(raw, `/\:`) {
 		return ""
 	}
 	if ip := net.ParseIP(raw); ip != nil {
 		return ""
 	}
+
+	// A subdomain always has a dot. Without this check, banner text from tools
+	// that print headings on stdout ("Session", "FQDN:") is taken for a host and
+	// burns a DNS lookup each.
+	if !strings.Contains(raw, ".") || !validHostLabels(raw) {
+		return ""
+	}
 	return raw
+}
+
+// validHostLabels rejects labels with characters DNS does not allow, and empty
+// labels such as "a..b".
+func validHostLabels(host string) bool {
+	for _, label := range strings.Split(host, ".") {
+		if label == "" {
+			return false
+		}
+		for _, r := range label {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }
 
 type resultWriter struct {
@@ -1723,6 +1795,11 @@ func runChecks(ctx context.Context, hosts []string, cfg config, emit func(result
 	resolvers, err := loadResolverPool(cfg.resolverFile)
 	if err != nil {
 		return err
+	}
+	// Always keep a pool: even without -r it holds the DNS cache that lets the
+	// HTTP dial reuse the address the DNS phase already resolved.
+	if resolvers == nil {
+		resolvers = newResolverPool(nil)
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -1859,9 +1936,9 @@ func newHTTPClient(cfg config, resolvers *resolverPool) *http.Client {
 		MaxIdleConnsPerHost: 4,
 		IdleConnTimeout:     30 * time.Second,
 	}
-	if resolvers != nil {
-		transport.DialContext = resolvers.dialContext(cfg.timeout)
-	}
+	// Dial through the pool so HTTP reuses the DNS phase's answer instead of
+	// resolving every host a second time.
+	transport.DialContext = resolvers.dialContext(cfg.timeout)
 
 	client := &http.Client{
 		Timeout:   cfg.timeout,
@@ -1883,6 +1960,7 @@ func sortResults(out []result) {
 
 func checkHost(ctx context.Context, host string, cfg config, client *http.Client, resolvers *resolverPool, wildcards *wildcardCache) result {
 	res := result{Host: host}
+	dnsOK := true
 
 	if cfg.mode == "dns" || cfg.mode == "both" {
 		ips, err := lookupHost(ctx, host, cfg.timeout, resolvers)
@@ -1894,13 +1972,18 @@ func checkHost(ctx context.Context, host string, cfg config, client *http.Client
 				res.Wildcard = true
 			}
 		} else {
+			dnsOK = false
 			res.Error = shortErr(err)
 			res.Live = false
-			return res
+			// A dangling CNAME does not resolve, but the takeover check can still
+			// follow the chain when -takeover is set.
+			if !cfg.takeover {
+				return res
+			}
 		}
 	}
 
-	if cfg.mode == "http" || cfg.mode == "both" {
+	if (cfg.mode == "http" || cfg.mode == "both") && dnsOK {
 		// Both schemes are probed in parallel under one budget, so a host that
 		// blackholes 443 still gets its HTTP chance within -timeout.
 		httpCtx, cancel := context.WithTimeout(ctx, cfg.timeout)
@@ -1931,12 +2014,9 @@ func checkHost(ctx context.Context, host string, cfg config, client *http.Client
 	}
 
 	if cfg.takeover {
-		// When the HTTP phase already failed, fetching the page again just
-		// repeats the same timeout; the DNS-based dangling check still runs.
-		fetchBody := true
-		if cfg.mode == "http" || cfg.mode == "both" {
-			fetchBody = res.Live
-		}
+		// Fetch the page only when the HTTP phase actually succeeded; otherwise
+		// it just repeats the same timeout. The CNAME/dangling check still runs.
+		fetchBody := res.Live
 		tr := detectTakeover(ctx, host, cfg.timeout, resolvers, client, cfg.limiter, fetchBody)
 		res.CNAME = tr.CNAME
 		res.Takeover = tr.Vulnerable
@@ -2159,7 +2239,7 @@ func newResolverPool(addrs []string) *resolverPool {
 			},
 		})
 	}
-	return &resolverPool{addrs: addrs, resolvers: resolvers}
+	return &resolverPool{addrs: addrs, resolvers: resolvers, cache: make(map[string][]string)}
 }
 
 func loadResolverPool(path string) (*resolverPool, error) {
@@ -2231,11 +2311,48 @@ func normalizeResolver(line string) string {
 }
 
 func (p *resolverPool) lookupHost(ctx context.Context, host string) ([]string, error) {
-	if p == nil || len(p.resolvers) == 0 {
+	if p == nil {
 		return net.DefaultResolver.LookupHost(ctx, host)
 	}
-	idx := atomic.AddUint64(&p.next, 1)
-	return p.resolvers[int(idx-1)%len(p.resolvers)].LookupHost(ctx, host)
+	if cached, ok := p.cached(host); ok {
+		return cached, nil
+	}
+
+	var (
+		ips []string
+		err error
+	)
+	if len(p.resolvers) == 0 {
+		ips, err = net.DefaultResolver.LookupHost(ctx, host)
+	} else {
+		idx := atomic.AddUint64(&p.next, 1)
+		ips, err = p.resolvers[int(idx-1)%len(p.resolvers)].LookupHost(ctx, host)
+	}
+	if err != nil {
+		return nil, err
+	}
+	p.store(host, ips)
+	return ips, nil
+}
+
+func (p *resolverPool) cached(host string) ([]string, bool) {
+	p.cacheMu.RLock()
+	defer p.cacheMu.RUnlock()
+	ips, ok := p.cache[host]
+	return ips, ok
+}
+
+func (p *resolverPool) store(host string, ips []string) {
+	if len(ips) == 0 {
+		return
+	}
+	p.cacheMu.Lock()
+	defer p.cacheMu.Unlock()
+	if p.cache == nil {
+		p.cache = make(map[string][]string)
+	}
+	// Copy so a later sort of the caller's slice cannot reorder the cache.
+	p.cache[host] = append([]string(nil), ips...)
 }
 
 func (p *resolverPool) lookupCNAME(ctx context.Context, host string) (string, error) {
@@ -2255,9 +2372,14 @@ func (p *resolverPool) dialContext(timeout time.Duration) func(ctx context.Conte
 		if err != nil || net.ParseIP(host) != nil {
 			return dialer.DialContext(ctx, network, addr)
 		}
-		ips, err := p.lookupHost(ctx, host)
-		if err != nil {
-			return nil, err
+		// Reuse the DNS phase's answer when there is one; only resolve here for
+		// a name the scan had not seen (a redirect target, for example).
+		ips, ok := p.cached(host)
+		if !ok {
+			ips, err = p.lookupHost(ctx, host)
+			if err != nil {
+				return nil, err
+			}
 		}
 		var lastErr error
 		for _, ip := range ips {
@@ -2274,6 +2396,13 @@ func (p *resolverPool) dialContext(timeout time.Duration) func(ctx context.Conte
 	}
 }
 
+// httpFallbackDelay is how long the HTTP attempt waits before starting. HTTPS
+// is tried first; when it answers within this window the HTTP request is never
+// sent at all, which halves the traffic palm leaves on the target and keeps the
+// -rate budget for real hosts. A host that drops port 443 starts HTTP after the
+// delay, still inside the same -timeout budget.
+const httpFallbackDelay = 300 * time.Millisecond
+
 func checkHTTP(ctx context.Context, host string, cfg config, client *http.Client) (httpProbe, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -2284,33 +2413,76 @@ func checkHTTP(ctx context.Context, host string, cfg config, client *http.Client
 		scheme string
 	}
 
-	// Both schemes are probed at once under one budget, so a host that drops
-	// port 443 still gets its HTTP chance. The winner is decided by preference,
-	// never by which answer arrived first: HTTPS is used whenever it produced a
-	// usable response, otherwise HTTP. A timer-based shortcut here made the
-	// reported scheme differ between runs for the same host.
+	// HTTPS runs first. HTTP is started only if HTTPS has not produced a usable
+	// answer after httpFallbackDelay, so the common HTTPS case costs one request
+	// instead of two. The delay starts when the HTTPS request is actually on the
+	// wire, not when the goroutine starts: with -rate the request waits for a
+	// token first, and starting the timer earlier would fire the fallback while
+	// HTTPS is still queued. The final choice is still by preference (HTTPS
+	// whenever it worked), never by which answer arrived first, so results stay
+	// deterministic.
 	ch := make(chan outcome, 2)
-	for _, scheme := range []string{"https", "http"} {
-		scheme := scheme
+
+	httpsDispatched := make(chan struct{})
+	var dispatchOnce sync.Once
+	httpsCfg := cfg
+	httpsCfg.onDispatch = func() { dispatchOnce.Do(func() { close(httpsDispatched) }) }
+
+	go func() {
+		probe, err := requestURL(ctx, "https://"+host, httpsCfg, client)
+		ch <- outcome{probe: probe, err: err, scheme: "https"}
+	}()
+
+	httpStarted := false
+	startHTTP := func() {
+		if httpStarted {
+			return
+		}
+		httpStarted = true
 		go func() {
-			probe, err := requestURL(ctx, scheme+"://"+host, cfg, client)
-			ch <- outcome{probe: probe, err: err, scheme: scheme}
+			probe, err := requestURL(ctx, "http://"+host, cfg, client)
+			ch <- outcome{probe: probe, err: err, scheme: "http"}
 		}()
 	}
 
+	// fallbackReady fires on the delay, counted from the HTTPS dispatch.
+	fallbackReady := make(chan struct{})
+	go func() {
+		select {
+		case <-httpsDispatched:
+		case <-ctx.Done():
+			return
+		}
+		timer := time.NewTimer(httpFallbackDelay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			close(fallbackReady)
+		case <-ctx.Done():
+		}
+	}()
+
 	var httpOK *outcome
 	var lastErr error
-	for i := 0; i < 2; i++ {
-		out := <-ch
+	received := 0
+	for received < 2 {
+		var out outcome
+		select {
+		case out = <-ch:
+			received++
+		case <-fallbackReady:
+			startHTTP()
+			fallbackReady = nil
+			continue
+		}
 
 		if out.err == nil && statusAllowed(out.probe.StatusCode, cfg) {
 			if out.scheme == "https" {
-				// Returning cancels the HTTP attempt through the deferred cancel.
+				// Returning cancels any HTTP attempt through the deferred cancel.
 				return out.probe, nil
 			}
 			httpCopy := out
 			httpOK = &httpCopy
-			// Keep waiting for the HTTPS outcome to make the choice deterministic.
 			continue
 		}
 
@@ -2318,6 +2490,11 @@ func checkHTTP(ctx context.Context, host string, cfg config, client *http.Client
 			lastErr = out.err
 		} else {
 			lastErr = fmt.Errorf("status %d did not match filters", out.probe.StatusCode)
+		}
+
+		// HTTPS failed outright: no reason to keep waiting, try HTTP now.
+		if out.scheme == "https" {
+			startHTTP()
 		}
 	}
 
@@ -2335,7 +2512,7 @@ func requestURL(ctx context.Context, target string, cfg config, client *http.Cli
 	autoMethod := cfg.method == ""
 	if cfg.method != "" {
 		method = cfg.method
-	} else if cfg.title {
+	} else if cfg.title || cfg.waf {
 		method = http.MethodGet
 	}
 	probe, err := doRequest(ctx, target, method, cfg, client)
@@ -2370,6 +2547,9 @@ func isTimeoutErr(err error) bool {
 func doRequest(ctx context.Context, target, method string, cfg config, client *http.Client) (httpProbe, error) {
 	if err := cfg.limiter.Wait(ctx); err != nil {
 		return httpProbe{}, err
+	}
+	if cfg.onDispatch != nil {
+		cfg.onDispatch()
 	}
 	req, err := http.NewRequestWithContext(ctx, method, target, nil)
 	if err != nil {
@@ -2722,9 +2902,9 @@ type emitter interface {
 func newEmitter(cfg config) emitter {
 	switch effectiveFormat(cfg) {
 	case formatJSON:
-		return &jsonArrayEmitter{}
+		return &jsonArrayEmitter{cfg: cfg}
 	case formatXML:
-		return &xmlEmitter{}
+		return &xmlEmitter{cfg: cfg}
 	case formatHTML:
 		return &htmlEmitter{cfg: cfg}
 	default:
@@ -2753,8 +2933,13 @@ func shouldEmit(res result, cfg config) bool {
 		return false
 	}
 	// JSON, XML and HTML are reports: they include dead hosts with their error
-	// so the file explains what was checked. Text output only lists live ones.
-	if isReportFormat(effectiveFormat(cfg)) {
+	// so the file explains what was checked. Text output only lists live ones;
+	// JSONL is live-only too unless -include-dead asks for the full stream.
+	format := effectiveFormat(cfg)
+	if isReportFormat(format) {
+		return true
+	}
+	if cfg.includeDead && format == formatJSONL {
 		return true
 	}
 	return res.Live
@@ -2814,6 +2999,7 @@ func displayValue(res result, cfg config) string {
 }
 
 type jsonArrayEmitter struct {
+	cfg   config
 	wrote bool
 }
 
@@ -2823,6 +3009,9 @@ func (e *jsonArrayEmitter) Begin(w io.Writer) error {
 }
 
 func (e *jsonArrayEmitter) Emit(w io.Writer, res result) error {
+	if !shouldEmit(res, e.cfg) {
+		return nil
+	}
 	data, err := json.Marshal(res)
 	if err != nil {
 		return err
@@ -2841,7 +3030,7 @@ func (e *jsonArrayEmitter) End(w io.Writer) error {
 	return err
 }
 
-type xmlEmitter struct{ wrote bool }
+type xmlEmitter struct{ cfg config }
 
 func (e *xmlEmitter) Begin(w io.Writer) error {
 	_, err := io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?>`+"\n<results>\n")
@@ -2854,7 +3043,7 @@ func (e *xmlEmitter) End(w io.Writer) error {
 }
 
 func (e *xmlEmitter) Emit(w io.Writer, res result) error {
-	if !shouldEmit(res, config{format: formatXML}) {
+	if !shouldEmit(res, e.cfg) {
 		return nil
 	}
 	write := func(tag, value string) {

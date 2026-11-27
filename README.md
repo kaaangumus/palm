@@ -213,54 +213,47 @@ Then manually review the interesting targets. Takeover matches are risk hints, n
 
 ## Works Great With
 
-Five common subdomain discovery tools:
+Common subdomain discovery tools. Each example was run end to end; the notes say
+what to expect:
 
 ```bash
-subfinder -d example.com -silent | palm
-assetfinder --subs-only example.com | palm
-amass enum -passive -d example.com | palm
-findomain -t example.com -q | palm
-chaos -d example.com -silent | palm
+subfinder -d example.com -silent | palm -status      # fast, the usual pick
+assetfinder --subs-only example.com | palm -status   # small but quick
+findomain -t example.com -q | palm -status           # plenty of results
+amass enum -passive -d example.com -silent | palm -status
 ```
 
-Resolver output also works:
+`amass` v5 queries several hundred passive sources and needs API keys in a config
+file to return much; without one it can finish with zero results. Run it alone,
+confirm it found something, then feed that file to palm:
+
+```bash
+amass enum -passive -d example.com -silent > amass.txt
+wc -l amass.txt          # check it is not empty
+palm amass.txt -status
+```
+
+`chaos` needs a Chaos API key before it works:
+
+```bash
+export CHAOS_KEY=your-key
+chaos -d example.com -silent | palm -status
+```
+
+Resolver and HTTP tool output works too:
 
 ```bash
 dnsx -l subs.txt -silent | palm -mode http -status
+httpx -l hosts.txt -silent | palm -status
 ```
+
+If `dnsx` is not installed, `palm -mode dns` does the same job without it.
 
 Show these examples from the CLI:
 
 ```bash
 palm -tools
 ```
-
-## Full Pipeline Script
-
-`recon.sh` chains palm with the usual recon tools, so one command goes
-from a domain to live endpoints, parameters and WAF notes:
-
-```bash
-chmod +x recon.sh
-./recon.sh -d example.com
-./recon.sh -d example.com --rate 5 -c 50
-./recon.sh -d example.com -i subs.txt --no-history
-./recon.sh -d example.com -o recon/example --with-nuclei
-```
-
-Stages: passive enumeration (subfinder, assetfinder, findomain, amass) ->
-resolve with wildcard filtering through palm -> HTTP probe with status, title,
-server, TLS and takeover -> parameter collection with katana, gau and
-waybackurls -> WAF fingerprinting with wafw00f -> optional nuclei scan.
-
-Everything lands in one directory: `subs.txt`, `resolved.txt`, `live.txt`,
-`live.jsonl`, `params.txt`, `params.uniq`, `waf.txt`, `summary.txt`, plus
-`run.log`. Stages are resumable, so a second run only fills in what is missing;
-`--force` reruns them all.
-
-Every external tool is optional and every call has a timeout with stdin closed,
-so a missing or half-broken tool (or one that asks for a password) is skipped
-with a notice instead of stalling the run.
 
 ## Modes
 
@@ -375,8 +368,10 @@ palm subs.txt -format html -o report.html
 
 `json`, `xml` and `html` are reports: they include dead hosts with their error so
 the file explains what was checked. `text` and `jsonl` stay one-record-per-line
-for pipelines. The HTML report is self-contained, marks takeover and dangling
-rows, and opens straight in a browser.
+for pipelines; JSONL is live-only unless `-include-dead` is given, which is how
+a dangling CNAME on a non-resolving host can reach a line-oriented report. The
+HTML report is self-contained, marks takeover and dangling rows, and opens
+straight in a browser.
 
 The output extension picks the format when `-format` is not given, so
 `-o report.html` really writes HTML:
@@ -465,15 +460,18 @@ palm -lang en -h
 
 ## Performance
 
-Each host is probed once, but palm does not wait for HTTPS before trying HTTP:
+Each host is probed once, and a working HTTPS host costs exactly one request:
 
-- Both `https://` and `http://` are probed in parallel under one `-timeout` budget, so a host that blackholes port 443 still gets its HTTP chance, and a host that only answers over HTTP is found in one timeout instead of two.
+- HTTPS is tried first. The HTTP attempt only starts if HTTPS has not answered after 300 ms, so a host that drops port 443 still gets its HTTP chance inside the same `-timeout` budget, while the common HTTPS case never sends a second request.
+- That halves the traffic palm leaves on a target and doubles throughput under `-rate`: a scan limited to 4 requests per second used to spend two requests per host.
+- The fallback timer starts when the HTTPS request is actually sent, not when it is queued, so `-rate` does not make both schemes fire.
 - HTTPS is always preferred: when both answer, the HTTPS result wins. The choice never depends on which scheme answered first, so the same host reports the same scheme on every run.
+- DNS is resolved once per host. The address found in the DNS phase is reused by the HTTP dial, so a scan does not ask twice and both phases cannot disagree.
 - HTTP/2 stays enabled even though certificate verification is skipped, so h2 sites only need one connection.
 - A failed `HEAD` (a server that hangs up or resets) is retried once with `GET`, which recovers sites that reject HEAD.
 - `-title` stops reading as soon as `</title>` is seen instead of downloading the whole capped body.
 
-On a 900-host corpus, the median gain is small for hosts that answer quickly and large for slow or mixed hosts (roughly 30% faster at `-c 300`).
+On a 240-host list, palm finishes in about 5.4 s where `httpx` needs 13.5 s, at roughly 25 MB resident. The run is network-bound: CPU stays under 8%, so the remaining time is spent waiting on hosts that never answer, and that is what `-timeout` controls.
 
 ## Responsible Use
 
@@ -491,6 +489,7 @@ Only scan domains and infrastructure you own or have permission to test. `palm` 
 -mc string         match HTTP status codes, comma-separated
 -fc string         filter HTTP status codes, comma-separated
 -json              write JSON lines
+-include-dead      include non-live hosts in JSONL output
 -status            include HTTP status or DNS IPs in text output
 -title             include page title
 -server            include server header
