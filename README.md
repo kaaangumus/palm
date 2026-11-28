@@ -20,7 +20,7 @@
   <code>subfinder -d example.com -silent | palm -status -title -server</code>
 </p>
 
-**palm** is a bug bounty focused subdomain recon pre-filter. It sits after tools like `subfinder`, `amass`, `assetfinder`, `findomain`, or `chaos` and turns noisy discovery output into clean, live, actionable targets.
+**palm** is a bug bounty focused subdomain recon pre-filter. It sits after tools like `subfinder`, `assetfinder`, or `findomain` and turns noisy discovery output into clean, live, actionable targets.
 
 It reads subdomains from stdin or a `.txt` file, removes duplicates, normalizes messy tool output, checks DNS/HTTP liveness, adds lightweight context, and highlights possible subdomain takeover risks.
 
@@ -213,41 +213,22 @@ Then manually review the interesting targets. Takeover matches are risk hints, n
 
 ## Works Great With
 
-Common subdomain discovery tools. Each example was run end to end; the notes say
-what to expect:
+Tools whose output palm reads, each run end to end. Any of them pipes straight in:
 
 ```bash
 subfinder -d example.com -silent | palm -status      # fast, the usual pick
 assetfinder --subs-only example.com | palm -status   # small but quick
 findomain -t example.com -q | palm -status           # plenty of results
-amass enum -passive -d example.com -silent | palm -status
 ```
 
-`amass` v5 queries several hundred passive sources and needs API keys in a config
-file to return much; without one it can finish with zero results. Run it alone,
-confirm it found something, then feed that file to palm:
+Existing HTTP results work too:
 
 ```bash
-amass enum -passive -d example.com -silent > amass.txt
-wc -l amass.txt          # check it is not empty
-palm amass.txt -status
-```
-
-`chaos` needs a Chaos API key before it works:
-
-```bash
-export CHAOS_KEY=your-key
-chaos -d example.com -silent | palm -status
-```
-
-Resolver and HTTP tool output works too:
-
-```bash
-dnsx -l subs.txt -silent | palm -mode http -status
 httpx -l hosts.txt -silent | palm -status
 ```
 
-If `dnsx` is not installed, `palm -mode dns` does the same job without it.
+Resolving is built in: `palm -mode dns` does what `dnsx` would, so no extra tool
+is needed.
 
 Show these examples from the CLI:
 

@@ -32,7 +32,7 @@ import (
 	"time"
 )
 
-var version = "0.7.4"
+var version = "0.7.5"
 
 const modulePath = "github.com/kaaangumus/palm"
 const latestReleaseURL = "https://api.github.com/repos/kaaangumus/palm/releases/latest"
@@ -1565,50 +1565,34 @@ func localizedToolsUsageLang(lang string) string {
 }
 
 func trToolsUsage() string {
-	return `palm ile yaygin arac ornekleri:
+	return `palm ile calisan arac ornekleri (hepsi bastan sona denendi):
 
   subfinder -d example.com -silent | palm -status
   assetfinder --subs-only example.com | palm -status
   findomain -t example.com -q | palm -status
-  amass enum -passive -d example.com -silent | palm -status
 
   httpx -l hosts.txt -silent | palm -status
-  dnsx -l subs.txt -silent | palm -mode http -status
-
-Notlar:
-  amass  v5 yuzlerce pasif kaynaga gider ve anlamli sonuc icin config dosyasinda
-         API anahtarlari ister; anahtarsiz sifir sonucla bitebilir. Ayri
-         calistir, sonuc geldigini dogrula, sonra dosyayi palm'a ver.
-  chaos  Chaos API anahtari ister: export CHAOS_KEY=... ardindan
-         chaos -d example.com -silent | palm -status
-  dnsx   projectdiscovery ile gelir; kurulu degilse palm -mode dns ayni isi
-         dnsx olmadan yapar.
 
 Not: palm stdin'den okur, txt dosyasi da kabul eder: palm subs.txt
+
+Cozumleme icin ek arac gerekmez: palm -mode dns ayni isi yapar, yani dnsx
+istege bagli ve sadece zaten kullaniyorsan anlamli.
 `
 }
 
 func toolsUsage() string {
-	return `Common tool pipelines for palm:
+	return `Tool pipelines for palm (each was run end to end):
 
   subfinder -d example.com -silent | palm -status
   assetfinder --subs-only example.com | palm -status
   findomain -t example.com -q | palm -status
-  amass enum -passive -d example.com -silent | palm -status
 
   httpx -l hosts.txt -silent | palm -status
-  dnsx -l subs.txt -silent | palm -mode http -status
-
-Notes:
-  amass  v5 runs several hundred passive sources and needs API keys in a config
-         file to return much; without one it can finish with zero results. Run it
-         on its own, check that it found something, then feed that file to palm.
-  chaos  needs a Chaos API key: export CHAOS_KEY=... then
-         chaos -d example.com -silent | palm -status
-  dnsx   comes with projectdiscovery; if it is not installed, palm -mode dns
-         does the same job without it.
 
 Tip: palm reads stdin and accepts txt files too: palm subs.txt
+
+No extra tool is needed for resolving: palm -mode dns does it, so dnsx is
+optional and only useful if you already run it.
 `
 }
 

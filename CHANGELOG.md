@@ -11,6 +11,16 @@ Fixes:
 - `-takeover` keeps checking the CNAME chain when DNS resolution fails, so dangling CNAMEs on non-resolving hosts can be reported.
 - Added `-include-dead`: JSONL output keeps non-live hosts too, so dangling CNAME records survive a line-oriented pipeline.
 
+## 0.7.5
+
+- `-tools` only lists tools whose pipelines were run end to end: subfinder,
+  assetfinder, findomain, and httpx. `amass` (v5 needs API keys and returned
+  nothing without them) and `chaos` (no Chaos key) were dropped rather than
+  advertised as working.
+- `dnsx` is no longer listed as a required step: `palm -mode dns` resolves hosts,
+  so dnsx is optional.
+- README intro and "Works Great With" trimmed to the same set.
+
 ## 0.7.4
 
 - Input is stricter: a host must contain a dot and only valid DNS label
